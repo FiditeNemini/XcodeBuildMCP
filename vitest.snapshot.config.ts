@@ -5,10 +5,10 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     include: ['src/snapshot-tests/__tests__/**/*.test.ts'],
-    pool: 'forks',
+    pool: 'threads',
     poolOptions: {
-      forks: {
-        maxForks: 1,
+      threads: {
+        maxThreads: 1,
       },
     },
     env: {
