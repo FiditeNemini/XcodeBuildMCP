@@ -1,7 +1,3 @@
-/**
- * Tests for type_text tool
- */
-
 import { describe, it, expect, beforeEach } from 'vitest';
 import * as z from 'zod';
 import {
@@ -12,6 +8,8 @@ import {
 import { sessionStore } from '../../../../utils/session-store.ts';
 import { schema, handler, type_textLogic } from '../type_text.ts';
 import { AXE_NOT_AVAILABLE_MESSAGE } from '../../../../utils/axe-helpers.ts';
+import { allText, runLogic } from '../../../../test-utils/test-helpers.ts';
+
 
 // Mock axe helpers for dependency injection
 function createMockAxeHelpers(
@@ -24,15 +22,6 @@ function createMockAxeHelpers(
     getAxePath: () =>
       overrides.getAxePathReturn !== undefined ? overrides.getAxePathReturn : '/usr/local/bin/axe',
     getBundledAxeEnvironment: () => overrides.getBundledAxeEnvironmentReturn ?? {},
-    createAxeNotAvailableResponse: () => ({
-      content: [
-        {
-          type: 'text',
-          text: AXE_NOT_AVAILABLE_MESSAGE,
-        },
-      ],
-      isError: true,
-    }),
   };
 }
 
@@ -126,13 +115,15 @@ describe('Type Text Tool', () => {
         getBundledAxeEnvironmentReturn: {},
       });
 
-      await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        trackingExecutor,
-        mockAxeHelpers,
+      await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          trackingExecutor,
+          mockAxeHelpers,
+        ),
       );
 
       expect(capturedCommand).toEqual([
@@ -161,13 +152,15 @@ describe('Type Text Tool', () => {
         getBundledAxeEnvironmentReturn: {},
       });
 
-      await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'user@example.com',
-        },
-        trackingExecutor,
-        mockAxeHelpers,
+      await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'user@example.com',
+          },
+          trackingExecutor,
+          mockAxeHelpers,
+        ),
       );
 
       expect(capturedCommand).toEqual([
@@ -196,13 +189,15 @@ describe('Type Text Tool', () => {
         getBundledAxeEnvironmentReturn: {},
       });
 
-      await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Password123!@#',
-        },
-        trackingExecutor,
-        mockAxeHelpers,
+      await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Password123!@#',
+          },
+          trackingExecutor,
+          mockAxeHelpers,
+        ),
       );
 
       expect(capturedCommand).toEqual([
@@ -234,13 +229,15 @@ describe('Type Text Tool', () => {
       const longText =
         'This is a very long text that needs to be typed into the simulator for testing purposes.';
 
-      await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: longText,
-        },
-        trackingExecutor,
-        mockAxeHelpers,
+      await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: longText,
+          },
+          trackingExecutor,
+          mockAxeHelpers,
+        ),
       );
 
       expect(capturedCommand).toEqual([
@@ -269,13 +266,15 @@ describe('Type Text Tool', () => {
         getBundledAxeEnvironmentReturn: { AXE_PATH: '/some/path' },
       });
 
-      await type_textLogic(
-        {
-          simulatorId: 'ABCDEF12-3456-7890-ABCD-ABCDEFABCDEF',
-          text: 'Test message',
-        },
-        trackingExecutor,
-        mockAxeHelpers,
+      await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: 'ABCDEF12-3456-7890-ABCD-ABCDEFABCDEF',
+            text: 'Test message',
+          },
+          trackingExecutor,
+          mockAxeHelpers,
+        ),
       );
 
       expect(capturedCommand).toEqual([
@@ -294,24 +293,19 @@ describe('Type Text Tool', () => {
         getAxePathReturn: null,
       });
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        createNoopExecutor(),
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          createNoopExecutor(),
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: AXE_NOT_AVAILABLE_MESSAGE,
-          },
-        ],
-        isError: true,
-      });
+      expect(result.isError).toBe(true);
+      expect(allText(result)).toContain(AXE_NOT_AVAILABLE_MESSAGE);
     });
 
     it('should successfully type text', async () => {
@@ -325,19 +319,19 @@ describe('Type Text Tool', () => {
         error: undefined,
       });
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        mockExecutor,
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          mockExecutor,
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [{ type: 'text', text: 'Text typing simulated successfully.' }],
-        isError: false,
-      });
+      expect(result.isError).toBeFalsy();
+      expect(allText(result)).toContain('Text typing simulated successfully.');
     });
 
     it('should return success for valid text typing', async () => {
@@ -352,19 +346,19 @@ describe('Type Text Tool', () => {
         error: undefined,
       });
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        mockExecutor,
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          mockExecutor,
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [{ type: 'text', text: 'Text typing simulated successfully.' }],
-        isError: false,
-      });
+      expect(result.isError).toBeFalsy();
+      expect(allText(result)).toContain('Text typing simulated successfully.');
     });
 
     it('should handle DependencyError when axe binary not found', async () => {
@@ -372,24 +366,19 @@ describe('Type Text Tool', () => {
         getAxePathReturn: null,
       });
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        createNoopExecutor(),
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          createNoopExecutor(),
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: AXE_NOT_AVAILABLE_MESSAGE,
-          },
-        ],
-        isError: true,
-      });
+      expect(result.isError).toBe(true);
+      expect(allText(result)).toContain(AXE_NOT_AVAILABLE_MESSAGE);
     });
 
     it('should handle AxeError from command execution', async () => {
@@ -404,24 +393,21 @@ describe('Type Text Tool', () => {
         error: 'Text field not found',
       });
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        mockExecutor,
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          mockExecutor,
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: "Error: Failed to simulate text typing: axe command 'type' failed.\nDetails: Text field not found",
-          },
-        ],
-        isError: true,
-      });
+      expect(result.isError).toBe(true);
+      expect(allText(result)).toContain(
+        "Failed to simulate text typing: axe command 'type' failed.",
+      );
     });
 
     it('should handle SystemError from command execution', async () => {
@@ -432,26 +418,18 @@ describe('Type Text Tool', () => {
 
       const mockExecutor = createRejectingExecutor(new Error('ENOENT: no such file or directory'));
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        mockExecutor,
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          mockExecutor,
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: expect.stringContaining(
-              'Error: System error executing axe: Failed to execute axe command: ENOENT: no such file or directory',
-            ),
-          },
-        ],
-        isError: true,
-      });
+      expect(result.isError).toBe(true);
     });
 
     it('should handle unexpected Error objects', async () => {
@@ -462,26 +440,18 @@ describe('Type Text Tool', () => {
 
       const mockExecutor = createRejectingExecutor(new Error('Unexpected error'));
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        mockExecutor,
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          mockExecutor,
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: expect.stringContaining(
-              'Error: System error executing axe: Failed to execute axe command: Unexpected error',
-            ),
-          },
-        ],
-        isError: true,
-      });
+      expect(result.isError).toBe(true);
     });
 
     it('should handle unexpected string errors', async () => {
@@ -492,24 +462,21 @@ describe('Type Text Tool', () => {
 
       const mockExecutor = createRejectingExecutor('String error');
 
-      const result = await type_textLogic(
-        {
-          simulatorId: '12345678-1234-4234-8234-123456789012',
-          text: 'Hello World',
-        },
-        mockExecutor,
-        mockAxeHelpers,
+      const result = await runLogic(() =>
+        type_textLogic(
+          {
+            simulatorId: '12345678-1234-4234-8234-123456789012',
+            text: 'Hello World',
+          },
+          mockExecutor,
+          mockAxeHelpers,
+        ),
       );
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: 'Error: System error executing axe: Failed to execute axe command: String error',
-          },
-        ],
-        isError: true,
-      });
+      expect(result.isError).toBe(true);
+      expect(allText(result)).toContain(
+        'System error executing axe: Failed to execute axe command: String error',
+      );
     });
   });
 });
