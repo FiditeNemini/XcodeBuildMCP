@@ -6,9 +6,8 @@ import { schema, handler, launch_app_simLogic, type SimulatorLauncher } from '..
 import type { LaunchWithLoggingResult } from '../../../../utils/simulator-steps.ts';
 import { runLogic } from '../../../../test-utils/test-helpers.ts';
 
-
 function createMockLauncher(overrides?: Partial<LaunchWithLoggingResult>): SimulatorLauncher {
-  return async (_uuid, _bundleId, _opts?) => ({
+  return async (_uuid, _bundleId, _executor, _opts?) => ({
     success: true,
     processId: 12345,
     logFilePath: '/tmp/mock-logs/test.log',
@@ -113,7 +112,7 @@ describe('launch_app_sim tool', () => {
     it('should pass args and env through to launcher', async () => {
       let capturedArgs: string[] | undefined;
       let capturedEnv: Record<string, string> | undefined;
-      const trackingLauncher: SimulatorLauncher = async (_uuid, _bundleId, opts?) => {
+      const trackingLauncher: SimulatorLauncher = async (_uuid, _bundleId, _executor, opts?) => {
         capturedArgs = opts?.args;
         capturedEnv = opts?.env;
         return { success: true, processId: 12345, logFilePath: '/tmp/test.log' };
@@ -263,7 +262,7 @@ describe('launch_app_sim tool', () => {
 
     it('should not pass env when env is undefined', async () => {
       let capturedEnv: Record<string, string> | undefined;
-      const trackingLauncher: SimulatorLauncher = async (_uuid, _bundleId, opts?) => {
+      const trackingLauncher: SimulatorLauncher = async (_uuid, _bundleId, _executor, opts?) => {
         capturedEnv = opts?.env;
         return { success: true, processId: 12345, logFilePath: '/tmp/test.log' };
       };
