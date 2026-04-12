@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getDefaultDebuggerManager } from '../utils/debugger/index.ts';
 import { activeLogSessions } from '../utils/log_capture.ts';
 import { activeDeviceLogSessions } from '../utils/log-capture/device-log-sessions.ts';
+import { listActiveSimulatorLaunchOsLogSessions } from '../utils/log-capture/simulator-launch-oslog-sessions.ts';
 import { activeProcesses } from '../mcp/tools/swift-package/active-processes.ts';
 import { getDaemonActivitySnapshot } from '../daemon/activity-registry.ts';
 import { listActiveVideoCaptureSessionIds } from '../utils/video_capture.ts';
@@ -61,6 +62,8 @@ export interface McpLifecycleSnapshot {
   activeOperationByCategory: Record<string, number>;
   debuggerSessionCount: number;
   simulatorLogSessionCount: number;
+  simulatorLaunchOsLogSessionCount: number;
+  ownedSimulatorLaunchOsLogSessionCount: number;
   deviceLogSessionCount: number;
   videoCaptureSessionCount: number;
   swiftPackageProcessCount: number;
@@ -157,23 +160,23 @@ export function classifyMcpLifecycleAnomalies(
     'uptimeMs' | 'rssBytes' | 'matchingMcpProcessCount' | 'matchingMcpPeerSummary'
   >,
 ): McpLifecycleAnomaly[] {
-  const anomalies = new Set<McpLifecycleAnomaly>();
+  const anomalies: McpLifecycleAnomaly[] = [];
   const peerCount = Math.max(0, (snapshot.matchingMcpProcessCount ?? 0) - 1);
 
   if (peerCount >= PEER_COUNT_HIGH_THRESHOLD) {
-    anomalies.add('peer-count-high');
+    anomalies.push('peer-count-high');
   }
   if (snapshot.matchingMcpPeerSummary.some((peer) => peer.ageSeconds >= PEER_AGE_HIGH_SECONDS)) {
-    anomalies.add('peer-age-high');
+    anomalies.push('peer-age-high');
   }
   if (snapshot.rssBytes >= HIGH_RSS_BYTES) {
-    anomalies.add('high-rss');
+    anomalies.push('high-rss');
   }
   if (snapshot.uptimeMs >= LONG_LIVED_UPTIME_MS && snapshot.rssBytes >= LONG_LIVED_HIGH_RSS_BYTES) {
-    anomalies.add('long-lived-high-rss');
+    anomalies.push('long-lived-high-rss');
   }
 
-  return [...anomalies].sort();
+  return anomalies.sort();
 }
 
 function isLikelyMcpProcessCommand(command: string): boolean {
@@ -247,12 +250,7 @@ async function sampleMcpPeerProcesses(
     const peers = matched
       .filter((entry) => entry.pid !== currentPid)
       .map(({ pid, ageSeconds, rssKb }) => ({ pid, ageSeconds, rssKb }))
-      .sort((left, right) => {
-        if (right.ageSeconds !== left.ageSeconds) {
-          return right.ageSeconds - left.ageSeconds;
-        }
-        return right.rssKb - left.rssKb;
-      })
+      .sort((left, right) => right.ageSeconds - left.ageSeconds || right.rssKb - left.rssKb)
       .slice(0, 5);
 
     return {
@@ -287,6 +285,7 @@ export async function buildMcpLifecycleSnapshot(options: {
     options.commandExecutor ?? getDefaultCommandExecutor(),
     process.pid,
   );
+  const simulatorLaunchOsLogSessions = await listActiveSimulatorLaunchOsLogSessions();
 
   const snapshotWithoutAnomalies = {
     pid: process.pid,
@@ -303,6 +302,10 @@ export async function buildMcpLifecycleSnapshot(options: {
     activeOperationByCategory: activitySnapshot.byCategory,
     debuggerSessionCount: getDefaultDebuggerManager().listSessions().length,
     simulatorLogSessionCount: activeLogSessions.size,
+    simulatorLaunchOsLogSessionCount: simulatorLaunchOsLogSessions.length,
+    ownedSimulatorLaunchOsLogSessionCount: simulatorLaunchOsLogSessions.filter(
+      (session) => session.ownedByCurrentProcess,
+    ).length,
     deviceLogSessionCount: activeDeviceLogSessions.size,
     videoCaptureSessionCount: listActiveVideoCaptureSessionIds().length,
     swiftPackageProcessCount: activeProcesses.size,

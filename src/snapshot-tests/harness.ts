@@ -1,101 +1,39 @@
 import { spawnSync, execSync } from 'node:child_process';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { normalizeSnapshotOutput } from './normalize.ts';
-import { loadManifest } from '../core/manifest/load-manifest.ts';
-import { getEffectiveCliName } from '../core/manifest/schema.ts';
-import { importToolModule } from '../core/manifest/import-tool-module.ts';
-import type { ToolManifestEntry } from '../core/manifest/schema.ts';
-import { postProcessSession } from '../runtime/tool-invoker.ts';
-import { createToolCatalog } from '../runtime/tool-catalog.ts';
-import type { ToolDefinition } from '../runtime/types.ts';
-import type { ToolHandlerContext } from '../rendering/types.ts';
-import { createRenderSession } from '../rendering/render.ts';
+import type { SnapshotResult, WorkflowSnapshotHarness } from './contracts.ts';
+import { resolveSnapshotToolManifest } from './tool-manifest-resolver.ts';
 
 const CLI_PATH = path.resolve(process.cwd(), 'build/cli.js');
 
-export interface SnapshotHarness {
-  invoke(
-    workflow: string,
-    cliToolName: string,
-    args: Record<string, unknown>,
-  ): Promise<SnapshotResult>;
-  cleanup(): void;
+export type SnapshotHarness = WorkflowSnapshotHarness;
+export type { SnapshotResult };
+
+function getSnapshotHarnessEnv(): Record<string, string> {
+  const { VITEST: _vitest, NODE_ENV: _nodeEnv, ...rest } = process.env;
+  return Object.fromEntries(
+    Object.entries(rest).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
 }
 
-export interface SnapshotResult {
-  text: string;
-  rawText: string;
-  isError: boolean;
-}
-
-function resolveToolManifest(
-  workflowId: string,
+function runSnapshotCli(
+  workflow: string,
   cliToolName: string,
-): {
-  toolModulePath: string;
-  isMcpOnly: boolean;
-  isStateful: boolean;
-  manifestEntry: ToolManifestEntry;
-} | null {
-  const manifest = loadManifest();
-  const workflow = manifest.workflows.get(workflowId);
-  if (!workflow) return null;
-
-  const isMcpOnly = !workflow.availability.cli;
-
-  for (const toolId of workflow.tools) {
-    const tool = manifest.tools.get(toolId);
-    if (!tool) continue;
-    if (getEffectiveCliName(tool) === cliToolName) {
-      return {
-        toolModulePath: tool.module,
-        isMcpOnly,
-        isStateful: tool.routing?.stateful === true,
-        manifestEntry: tool,
-      };
-    }
+  args: Record<string, unknown>,
+  output: 'text' | 'json' = 'text',
+): ReturnType<typeof spawnSync> {
+  const commandArgs = [CLI_PATH, workflow, cliToolName, '--json', JSON.stringify(args)];
+  if (output !== 'text') {
+    commandArgs.push('--output', output);
   }
 
-  return null;
-}
-
-function buildMinimalToolCatalog(
-  manifestEntry: ToolManifestEntry,
-  handler: ToolDefinition['handler'],
-): { tool: ToolDefinition; catalog: ReturnType<typeof createToolCatalog> } {
-  const manifest = loadManifest();
-  const noopHandler: ToolDefinition['handler'] = async () => {};
-
-  const allTools: ToolDefinition[] = Array.from(manifest.tools.values()).map((toolEntry) => ({
-    id: toolEntry.id,
-    cliName: getEffectiveCliName(toolEntry),
-    mcpName: toolEntry.names.mcp,
-    workflow: '',
-    description: toolEntry.description,
-    nextStepTemplates: toolEntry.nextSteps,
-    mcpSchema: {} as ToolDefinition['mcpSchema'],
-    cliSchema: {} as ToolDefinition['cliSchema'],
-    stateful: toolEntry.routing?.stateful ?? false,
-    handler: toolEntry.id === manifestEntry.id ? handler : noopHandler,
-  }));
-
-  const catalog = createToolCatalog(allTools);
-  const tool = catalog.getByToolId(manifestEntry.id) ?? allTools[0]!;
-  return { tool, catalog };
-}
-
-async function importSnapshotToolModule(toolModulePath: string) {
-  const sourceModulePath = path.resolve(process.cwd(), 'src', `${toolModulePath}.ts`);
-  const sourceModuleUrl = pathToFileURL(sourceModulePath).href;
-
-  try {
-    return (await import(sourceModuleUrl)) as {
-      handler: (params: Record<string, unknown>, ctx?: ToolHandlerContext) => Promise<void>;
-    };
-  } catch {
-    return importToolModule(toolModulePath);
-  }
+  return spawnSync('node', commandArgs, {
+    encoding: 'utf8',
+    timeout: 120000,
+    cwd: process.cwd(),
+    env: getSnapshotHarnessEnv(),
+  });
 }
 
 export async function createSnapshotHarness(): Promise<SnapshotHarness> {
@@ -104,30 +42,20 @@ export async function createSnapshotHarness(): Promise<SnapshotHarness> {
     cliToolName: string,
     args: Record<string, unknown>,
   ): Promise<SnapshotResult> {
-    const resolved = resolveToolManifest(workflow, cliToolName);
+    const resolved = resolveSnapshotToolManifest(workflow, cliToolName);
 
-    if (resolved?.isMcpOnly || resolved?.isStateful) {
-      return invokeDirect(resolved.toolModulePath, resolved.manifestEntry, args);
+    if (!resolved) {
+      throw new Error(`Tool '${cliToolName}' not found in workflow '${workflow}'`);
     }
 
-    return invokeCli(workflow, cliToolName, args);
-  }
+    if (resolved.isMcpOnly) {
+      throw new Error(`Tool '${cliToolName}' in workflow '${workflow}' is not CLI-available`);
+    }
 
-  async function invokeCli(
-    workflow: string,
-    cliToolName: string,
-    args: Record<string, unknown>,
-  ): Promise<SnapshotResult> {
-    const jsonArg = JSON.stringify(args);
-    const { VITEST, NODE_ENV, ...cleanEnv } = process.env;
-    const result = spawnSync('node', [CLI_PATH, workflow, cliToolName, '--json', jsonArg], {
-      encoding: 'utf8',
-      timeout: 120000,
-      cwd: process.cwd(),
-      env: cleanEnv,
-    });
+    const result = runSnapshotCli(workflow, cliToolName, args);
+    const stdout =
+      typeof result.stdout === 'string' ? result.stdout : (result.stdout?.toString('utf8') ?? '');
 
-    const stdout = result.stdout ?? '';
     return {
       text: normalizeSnapshotOutput(stdout),
       rawText: stdout,
@@ -135,81 +63,25 @@ export async function createSnapshotHarness(): Promise<SnapshotHarness> {
     };
   }
 
-  async function invokeDirect(
-    toolModulePath: string,
-    manifestEntry: ToolManifestEntry,
-    args: Record<string, unknown>,
-  ): Promise<SnapshotResult> {
-    const toolModule = await importSnapshotToolModule(toolModulePath);
-    const session = createRenderSession('text');
-    const ctx: ToolHandlerContext = {
-      emit: (event) => {
-        session.emit(event);
-      },
-      attach: (image) => {
-        session.attach(image);
-      },
-    };
-    await toolModule.handler(args, ctx);
-
-    const { tool, catalog } = buildMinimalToolCatalog(
-      manifestEntry,
-      toolModule.handler as ToolDefinition['handler'],
-    );
-    postProcessSession({
-      tool,
-      session,
-      ctx,
-      catalog,
-      runtime: 'mcp',
-      applyTemplateNextSteps: ctx.nextStepParams != null,
-    });
-
-    const rawText = session.finalize() + '\n';
-    return {
-      text: normalizeSnapshotOutput(rawText),
-      rawText,
-      isError: session.isError(),
-    };
-  }
-
-  function cleanup(): void {}
+  async function cleanup(): Promise<void> {}
 
   return { invoke, cleanup };
 }
 
-/**
- * Shut down all booted simulators except those in the keep list.
- * Use before list/resource tests to guarantee a deterministic simulator state.
- */
-export function shutdownAllSimulatorsExcept(keepUdids: string[] = []): void {
+type SimctlAvailableDevices = {
+  devices: Record<string, Array<{ udid: string; name: string; state: string }>>;
+};
+
+function getAvailableDevices(): SimctlAvailableDevices {
   const listOutput = execSync('xcrun simctl list devices available --json', {
     encoding: 'utf8',
   });
-  const data = JSON.parse(listOutput) as {
-    devices: Record<string, Array<{ udid: string; name: string; state: string }>>;
-  };
-  const keepSet = new Set(keepUdids);
-  for (const runtime of Object.values(data.devices)) {
-    for (const device of runtime) {
-      if (device.state === 'Booted' && !keepSet.has(device.udid)) {
-        try {
-          execSync(`xcrun simctl shutdown ${device.udid}`, { encoding: 'utf8' });
-        } catch {
-          // Ignore shutdown failures (device may already be shutting down).
-        }
-      }
-    }
-  }
+
+  return JSON.parse(listOutput) as SimctlAvailableDevices;
 }
 
 export async function ensureSimulatorBooted(simulatorName: string): Promise<string> {
-  const listOutput = execSync('xcrun simctl list devices available --json', {
-    encoding: 'utf8',
-  });
-  const data = JSON.parse(listOutput) as {
-    devices: Record<string, Array<{ udid: string; name: string; state: string }>>;
-  };
+  const data = getAvailableDevices();
 
   for (const runtime of Object.values(data.devices)) {
     for (const device of runtime) {
@@ -223,4 +95,35 @@ export async function ensureSimulatorBooted(simulatorName: string): Promise<stri
   }
 
   throw new Error(`Simulator "${simulatorName}" not found`);
+}
+
+export async function createTemporarySimulator(
+  simulatorName: string,
+  runtimeIdentifier: string,
+): Promise<string> {
+  const tempSimulatorName = `xcodebuildmcp-snapshot-${simulatorName}-${randomUUID()}`;
+  const udid = execSync(
+    `xcrun simctl create "${tempSimulatorName}" "${simulatorName}" "${runtimeIdentifier}"`,
+    {
+      encoding: 'utf8',
+    },
+  ).trim();
+
+  if (!udid) {
+    throw new Error(`Failed to create temporary simulator "${tempSimulatorName}"`);
+  }
+
+  return udid;
+}
+
+export async function shutdownSimulator(simulatorId: string): Promise<void> {
+  execSync(`xcrun simctl shutdown ${simulatorId}`, {
+    encoding: 'utf8',
+  });
+}
+
+export async function deleteSimulator(simulatorId: string): Promise<void> {
+  execSync(`xcrun simctl delete ${simulatorId}`, {
+    encoding: 'utf8',
+  });
 }

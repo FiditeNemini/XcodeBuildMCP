@@ -10,6 +10,7 @@
  */
 
 import { log } from './logger.ts';
+import { toErrorMessage } from './errors.ts';
 import type { XcodePlatform } from './xcode.ts';
 import { executeXcodeBuildCommand } from './build/index.ts';
 import { extractTestFailuresFromXcresult } from './xcresult-test-failures.ts';
@@ -19,6 +20,7 @@ import type { CommandExecutor, CommandExecOptions } from './command.ts';
 import { getDefaultCommandExecutor } from './command.ts';
 import {
   formatTestDiscovery,
+  formatTestSelectionSummary,
   collectResolvedTestSelectors,
   type TestPreflightResult,
 } from './test-preflight.ts';
@@ -26,7 +28,7 @@ import { formatToolPreflight } from './build-preflight.ts';
 import { resolveDeviceName } from './device-name-resolver.ts';
 import { createSimulatorTwoPhaseExecutionPlan } from './simulator-test-execution.ts';
 import { startBuildPipeline } from './xcodebuild-pipeline.ts';
-import type { XcodebuildPipeline } from './xcodebuild-pipeline.ts';
+import type { StartedPipeline, XcodebuildPipeline } from './xcodebuild-pipeline.ts';
 import { finalizeInlineXcodebuild } from './xcodebuild-output.ts';
 import { getHandlerContext } from './typed-tool-factory.ts';
 
@@ -76,6 +78,7 @@ export async function handleTestLogic(
     `Starting test run for scheme ${params.scheme} on platform ${params.platform} (internal)`,
   );
   const ctx = getHandlerContext();
+  let started: StartedPipeline | null = null;
 
   try {
     const execOpts: CommandExecOptions | undefined = params.testRunnerEnv
@@ -102,11 +105,22 @@ export async function handleTestLogic(
       deviceName,
     });
 
+    const selectionText = options?.preflight
+      ? formatTestSelectionSummary(options.preflight)
+      : undefined;
     const discoveryText = options?.preflight ? formatTestDiscovery(options.preflight) : undefined;
 
-    const preflightText = discoveryText ? `${configText}\n${discoveryText}` : configText;
+    const preflightParts = [selectionText ? configText.trimEnd() : configText];
+    if (selectionText) {
+      preflightParts.push(selectionText);
+      preflightParts.push('');
+    }
+    if (discoveryText) {
+      preflightParts.push(discoveryText);
+    }
+    const preflightText = preflightParts.join('\n');
 
-    const started = startBuildPipeline({
+    started = startBuildPipeline({
       operation: 'TEST',
       toolName: resolvedToolName,
       params: {
@@ -116,6 +130,8 @@ export async function handleTestLogic(
         simulatorName: params.simulatorName,
         simulatorId: params.simulatorId,
         deviceId: params.deviceId,
+        onlyTesting: options?.preflight?.selectors.onlyTesting.map((selector) => selector.raw),
+        skipTesting: options?.preflight?.selectors.skipTesting.map((selector) => selector.raw),
         preflight: preflightText,
       },
       message: preflightText,
@@ -224,10 +240,22 @@ export async function handleTestLogic(
       durationMs: Date.now() - started.startedAt,
       responseContent: singlePhaseResult.content,
     });
-    return;
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorMessage = toErrorMessage(error);
     log('error', `Error during test run: ${errorMessage}`);
+
+    if (started) {
+      finalizeInlineXcodebuild({
+        started,
+        emit: ctx.emit,
+        succeeded: false,
+        durationMs: Date.now() - started.startedAt,
+        responseContent: [{ type: 'text', text: `Error during test run: ${errorMessage}` }],
+        errorFallbackPolicy: 'always',
+      });
+      return;
+    }
+
     ctx.emit(
       header('Test Run', [
         { label: 'Scheme', value: params.scheme },

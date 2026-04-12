@@ -2,9 +2,18 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { log } from './logging/index.ts';
+import { toErrorMessage } from './errors.ts';
 import type { CommandExecutor } from './CommandExecutor.ts';
 import { normalizeSimctlChildEnv } from './environment.ts';
 import { LOG_DIR } from './log-paths.ts';
+import {
+  registerSimulatorLaunchOsLogSession,
+  stopSimulatorLaunchOsLogSessionsForApp,
+} from './log-capture/simulator-launch-oslog-sessions.ts';
+
+function formatLogTimestamp(): string {
+  return new Date().toISOString().replace(/:/g, '-').replace('.', '-');
+}
 
 export interface StepResult {
   success: boolean;
@@ -42,23 +51,25 @@ export async function findSimulatorById(
 
   for (const runtime in simulatorsData.devices) {
     const devices = simulatorsData.devices[runtime];
-    if (Array.isArray(devices)) {
-      for (const device of devices) {
-        if (
-          typeof device === 'object' &&
-          device !== null &&
-          'udid' in device &&
-          'name' in device &&
-          'state' in device &&
-          typeof device.udid === 'string' &&
-          typeof device.name === 'string' &&
-          typeof device.state === 'string' &&
-          device.udid === simulatorId
-        ) {
-          return {
-            simulator: { udid: device.udid, name: device.name, state: device.state },
-          };
-        }
+    if (!Array.isArray(devices)) {
+      continue;
+    }
+
+    for (const device of devices) {
+      if (
+        typeof device === 'object' &&
+        device !== null &&
+        'udid' in device &&
+        'name' in device &&
+        'state' in device &&
+        typeof device.udid === 'string' &&
+        typeof device.name === 'string' &&
+        typeof device.state === 'string' &&
+        device.udid === simulatorId
+      ) {
+        return {
+          simulator: { udid: device.udid, name: device.name, state: device.state },
+        };
       }
     }
   }
@@ -153,7 +164,7 @@ export async function launchSimulatorAppWithLogging(
   const spawner = deps?.spawner ?? spawn;
 
   const logsDir = LOG_DIR;
-  const ts = new Date().toISOString().replace(/:/g, '-').replace('.', '-').slice(0, -1) + 'Z';
+  const ts = formatLogTimestamp();
   const logFileName = `${bundleId}_${ts}_pid${process.pid}.log`;
   const logFilePath = path.join(logsDir, logFileName);
 
@@ -202,9 +213,13 @@ export async function launchSimulatorAppWithLogging(
     const processId = await resolveAppPidViaLaunch(simulatorUuid, bundleId, executor);
 
     // Start OSLog stream as a separate detached process writing to its own file
-    const osLogPath = startOsLogStream(simulatorUuid, bundleId, logsDir, spawner);
+    const osLogPath = await startTrackedOsLogStream(simulatorUuid, bundleId, logsDir, spawner);
 
-    log('info', `Simulator app launched with logging: ${logFilePath}`);
+    if (osLogPath) {
+      log('info', `Simulator app launched with logging: ${logFilePath}`);
+    } else {
+      log('warn', `Simulator app launched, but OSLog capture did not start: ${logFilePath}`);
+    }
     return { success: true, processId, logFilePath, osLogPath };
   } catch (error) {
     if (fd !== undefined) {
@@ -214,7 +229,7 @@ export async function launchSimulatorAppWithLogging(
         /* already closed */
       }
     }
-    const message = error instanceof Error ? error.message : String(error);
+    const message = toErrorMessage(error);
     log('error', `Failed to launch simulator app with logging: ${message}`);
     return { success: false, logFilePath, error: message };
   }
@@ -248,17 +263,30 @@ function readLogFileSafe(filePath: string): string {
   }
 }
 
-function startOsLogStream(
+async function startTrackedOsLogStream(
   simulatorUuid: string,
   bundleId: string,
   logsDir: string,
   spawner: ProcessSpawner,
-): string | undefined {
-  const ts = new Date().toISOString().replace(/:/g, '-').replace('.', '-').slice(0, -1) + 'Z';
+): Promise<string | undefined> {
+  const ts = formatLogTimestamp();
   const osLogFilePath = path.join(logsDir, `${bundleId}_oslog_${ts}_pid${process.pid}.log`);
 
   let fd: number | undefined;
   try {
+    const cleanupResult = await stopSimulatorLaunchOsLogSessionsForApp(
+      simulatorUuid,
+      bundleId,
+      1000,
+    );
+    if (cleanupResult.errorCount > 0) {
+      log(
+        'warn',
+        `Skipping OSLog stream start after cleanup failure: ${cleanupResult.errors.join('; ')}`,
+      );
+      return undefined;
+    }
+
     fd = fs.openSync(osLogFilePath, 'w');
 
     const child = spawner(
@@ -278,8 +306,26 @@ function startOsLogStream(
         detached: true,
       },
     );
+
+    try {
+      await registerSimulatorLaunchOsLogSession({
+        process: child,
+        simulatorUuid,
+        bundleId,
+        logFilePath: osLogFilePath,
+      });
+    } catch (error) {
+      try {
+        child.kill?.('SIGTERM');
+      } catch {
+        // Best-effort cleanup after failed durable registration.
+      }
+      throw error;
+    }
+
     child.unref();
     fs.closeSync(fd);
+    fd = undefined;
     return osLogFilePath;
   } catch (error) {
     if (fd !== undefined) {
@@ -289,7 +335,7 @@ function startOsLogStream(
         /* already closed */
       }
     }
-    const message = error instanceof Error ? error.message : String(error);
+    const message = toErrorMessage(error);
     log('warn', `Failed to start OSLog stream: ${message}`);
     return undefined;
   }

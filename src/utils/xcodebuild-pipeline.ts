@@ -72,19 +72,16 @@ function injectBuildLogIntoTailEvents(
     return tailEvents;
   }
 
-  const detailTreeIndex = tailEvents.findIndex((event) => event.type === 'detail-tree');
-  if (detailTreeIndex !== -1) {
-    const detailTreeEvent = tailEvents[detailTreeIndex];
-    if (detailTreeEvent.type !== 'detail-tree') {
-      return tailEvents;
-    }
-
-    const updatedTailEvents = [...tailEvents];
-    updatedTailEvents[detailTreeIndex] = {
-      ...detailTreeEvent,
-      items: [...detailTreeEvent.items, { label: 'Build Logs', value: logPath }],
-    };
-    return updatedTailEvents;
+  const existingDetailTree = tailEvents.find((event) => event.type === 'detail-tree');
+  if (existingDetailTree) {
+    return tailEvents.map((event) =>
+      event === existingDetailTree
+        ? {
+            ...existingDetailTree,
+            items: [...existingDetailTree.items, { label: 'Build Logs', value: logPath }],
+          }
+        : event,
+    );
   }
 
   const nextStepsIndex = tailEvents.findIndex((event) => event.type === 'next-steps');
@@ -118,6 +115,10 @@ function buildHeaderParams(
     file: 'File',
     targetFilter: 'Target Filter',
   };
+  const arrayLabelMap: Record<string, string> = {
+    onlyTesting: '-only-testing',
+    skipTesting: '-skip-testing',
+  };
 
   const pathKeys = new Set(['workspacePath', 'projectPath', 'derivedDataPath', 'xcresultPath']);
 
@@ -139,6 +140,19 @@ function buildHeaderParams(
         displayValue = value;
       }
       result.push({ label, value: displayValue });
+    }
+  }
+
+  for (const [key, label] of Object.entries(arrayLabelMap)) {
+    const value = params[key];
+    if (!Array.isArray(value)) {
+      continue;
+    }
+
+    for (const entry of value) {
+      if (typeof entry === 'string' && entry.length > 0) {
+        result.push({ label, value: entry });
+      }
     }
   }
 
