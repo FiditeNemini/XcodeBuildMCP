@@ -14,6 +14,8 @@ export {
   __setTestInteractiveSpawnerOverride,
   __clearTestInteractiveSpawnerOverride,
 } from './interactive-process.ts';
+export { DefaultStreamingExecutionContext } from './tool-execution-context.ts';
+export type { StreamingExecutionContextOptions } from './tool-execution-context.ts';
 
 // Types
 export type { CommandExecutor, CommandResponse, CommandExecOptions } from '../CommandExecutor.ts';

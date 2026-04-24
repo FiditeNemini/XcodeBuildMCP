@@ -1,4 +1,7 @@
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { WorkflowSelectionDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
 import { createTypedTool, getHandlerContext } from '../../../utils/typed-tool-factory.ts';
 import { getDefaultCommandExecutor, type CommandExecutor } from '../../../utils/execution/index.ts';
@@ -7,7 +10,7 @@ import {
   getRegisteredWorkflows,
   getMcpPredicateContext,
 } from '../../../utils/tool-registry.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 
 const baseSchemaObject = z.object({
   workflowNames: z.array(z.string()).describe('Workflow directory name(s).'),
@@ -17,32 +20,85 @@ const baseSchemaObject = z.object({
 const manageWorkflowsSchema = z.preprocess(nullifyEmptyStrings, baseSchemaObject);
 
 export type ManageWorkflowsParams = z.infer<typeof manageWorkflowsSchema>;
+type ManageWorkflowsResult = WorkflowSelectionDomainResult;
+
+const STRUCTURED_OUTPUT_SCHEMA = 'xcodebuildmcp.output.workflow-selection';
+
+function createManageWorkflowsResult(
+  enabledWorkflows: string[],
+  registeredToolCount: number,
+): ManageWorkflowsResult {
+  return {
+    kind: 'workflow-selection',
+    didError: false,
+    error: null,
+    enabledWorkflows,
+    registeredToolCount,
+  };
+}
+
+function createManageWorkflowsErrorResult(message: string): ManageWorkflowsResult {
+  return {
+    kind: 'workflow-selection',
+    didError: true,
+    error: message,
+    enabledWorkflows: [],
+    registeredToolCount: 0,
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: ManageWorkflowsResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: STRUCTURED_OUTPUT_SCHEMA,
+    schemaVersion: '1',
+  };
+}
+
+export function createManageWorkflowsExecutor(): NonStreamingExecutor<
+  ManageWorkflowsParams,
+  ManageWorkflowsResult
+> {
+  return async (params) => {
+    try {
+      const workflowNames = params.workflowNames;
+      const currentWorkflows = getRegisteredWorkflows();
+      const requestedSet = new Set(
+        workflowNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
+      );
+      let nextWorkflows: string[];
+      if (params.enable === false) {
+        nextWorkflows = currentWorkflows.filter((name) => !requestedSet.has(name.toLowerCase()));
+      } else {
+        nextWorkflows = [...new Set([...currentWorkflows, ...workflowNames])];
+      }
+
+      const predicateContext = getMcpPredicateContext();
+      const registryState = await applyWorkflowSelectionFromManifest(
+        nextWorkflows,
+        predicateContext,
+      );
+
+      return createManageWorkflowsResult(
+        registryState.enabledWorkflows,
+        registryState.registeredToolCount,
+      );
+    } catch (error) {
+      const message = `Failed to update workflows: ${toErrorMessage(error)}`;
+      return createManageWorkflowsErrorResult(message);
+    }
+  };
+}
 
 export async function manage_workflowsLogic(
   params: ManageWorkflowsParams,
   _neverExecutor: CommandExecutor,
 ): Promise<void> {
   const ctx = getHandlerContext();
-  const workflowNames = params.workflowNames;
-  const currentWorkflows = getRegisteredWorkflows();
-  const requestedSet = new Set(
-    workflowNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
-  );
-  let nextWorkflows: string[];
-  if (params.enable === false) {
-    nextWorkflows = currentWorkflows.filter((name) => !requestedSet.has(name.toLowerCase()));
-  } else {
-    nextWorkflows = [...new Set([...currentWorkflows, ...workflowNames])];
-  }
+  const executeManageWorkflows = createManageWorkflowsExecutor();
+  const result = await executeManageWorkflows(params);
 
-  const predicateContext = getMcpPredicateContext();
-  const registryState = await applyWorkflowSelectionFromManifest(nextWorkflows, predicateContext);
-
-  ctx.emit(header('Manage Workflows'));
-  ctx.emit(section('Enabled Workflows', registryState.enabledWorkflows));
-  ctx.emit(
-    statusLine('success', `Workflows enabled: ${registryState.enabledWorkflows.join(', ')}`),
-  );
+  setStructuredOutput(ctx, result);
 }
 
 export const schema = baseSchemaObject.shape;

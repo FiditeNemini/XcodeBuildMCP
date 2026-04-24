@@ -7,23 +7,37 @@
  */
 
 import * as z from 'zod';
-import { handleTestLogic } from '../../../utils/test/index.ts';
+import type { TestResultDomainResult } from '../../../types/domain-results.ts';
+import type { StreamingExecutor } from '../../../types/tool-execution.ts';
+import { createTestExecutor } from '../../../utils/test/index.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor, FileSystemExecutor } from '../../../utils/execution/index.ts';
 import {
   getDefaultCommandExecutor,
   getDefaultFileSystemExecutor,
 } from '../../../utils/execution/index.ts';
-import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
+import {
+  nullifyEmptyStrings,
+  withProjectOrWorkspace,
+  withSimulatorIdOrName,
+} from '../../../utils/schema-helpers.ts';
 import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { inferPlatform } from '../../../utils/infer-platform.ts';
-import { resolveTestPreflight } from '../../../utils/test-preflight.ts';
+import { inferPlatform, type InferPlatformResult } from '../../../utils/infer-platform.ts';
+import { resolveTestPreflight, type TestPreflightResult } from '../../../utils/test-preflight.ts';
 import { resolveSimulatorIdOrName } from '../../../utils/simulator-resolver.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
+import {
+  createStreamingExecutionContext,
+  createDomainStreamingPipeline,
+  createTestDomainResult,
+  setXcodebuildStructuredOutput,
+} from '../../../utils/xcodebuild-domain-results.ts';
+import type { BuildInvocationRequest } from '../../../types/domain-fragments.ts';
+import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
 
 const baseSchemaObject = z.object({
   projectPath: z
@@ -69,35 +83,28 @@ const baseSchemaObject = z.object({
 
 const testSimulatorSchema = z.preprocess(
   nullifyEmptyStrings,
-  baseSchemaObject
-    .refine((val) => val.projectPath !== undefined || val.workspacePath !== undefined, {
-      message: 'Either projectPath or workspacePath is required.',
-    })
-    .refine((val) => !(val.projectPath !== undefined && val.workspacePath !== undefined), {
-      message: 'projectPath and workspacePath are mutually exclusive. Provide only one.',
-    })
-    .refine((val) => val.simulatorId !== undefined || val.simulatorName !== undefined, {
-      message: 'Either simulatorId or simulatorName is required.',
-    })
-    .refine((val) => !(val.simulatorId !== undefined && val.simulatorName !== undefined), {
-      message: 'simulatorId and simulatorName are mutually exclusive. Provide only one.',
-    }),
+  withSimulatorIdOrName(withProjectOrWorkspace(baseSchemaObject)),
 );
 
 type TestSimulatorParams = z.infer<typeof testSimulatorSchema>;
+type TestSimulatorResult = TestResultDomainResult;
 
-export async function test_simLogic(
+interface PreparedTestSimExecution {
+  configuration: string;
+  platform: InferPlatformResult['platform'];
+  preflight?: TestPreflightResult;
+  resolvedSimulatorId?: string;
+  invocationRequest: BuildInvocationRequest;
+  resolutionError?: string;
+  warningMessage?: string;
+}
+
+async function prepareTestSimExecution(
   params: TestSimulatorParams,
   executor: CommandExecutor,
-  fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
-): Promise<void> {
-  if (params.simulatorId && params.useLatestOS !== undefined) {
-    log(
-      'warn',
-      'useLatestOS parameter is ignored when using simulatorId (UUID implies exact device/OS)',
-    );
-  }
-
+  fileSystemExecutor: FileSystemExecutor,
+): Promise<PreparedTestSimExecution> {
+  const configuration = params.configuration ?? 'Debug';
   const inferred = await inferPlatform(
     {
       projectPath: params.projectPath,
@@ -108,22 +115,35 @@ export async function test_simLogic(
     },
     executor,
   );
+
   log(
     'info',
     `Inferred simulator platform for tests: ${inferred.platform} (source: ${inferred.source})`,
   );
-
-  const ctx = getHandlerContext();
 
   const simulatorResolution = await resolveSimulatorIdOrName(
     executor,
     params.simulatorId,
     params.simulatorName,
   );
+
   if (!simulatorResolution.success) {
-    ctx.emit(header('Test Simulator'));
-    ctx.emit(statusLine('error', simulatorResolution.error));
-    return;
+    return {
+      configuration,
+      platform: inferred.platform,
+      resolutionError: simulatorResolution.error,
+      invocationRequest: {
+        scheme: params.scheme,
+        configuration,
+        platform: inferred.platform,
+        simulatorName: params.simulatorName,
+        simulatorId: params.simulatorId,
+      },
+      warningMessage:
+        params.simulatorId && params.useLatestOS !== undefined
+          ? 'useLatestOS parameter is ignored when using simulatorId (UUID implies exact device/OS)'
+          : undefined,
+    };
   }
 
   const destinationName = params.simulatorName ?? simulatorResolution.simulatorName;
@@ -132,35 +152,110 @@ export async function test_simLogic(
       projectPath: params.projectPath,
       workspacePath: params.workspacePath,
       scheme: params.scheme,
-      configuration: params.configuration ?? 'Debug',
+      configuration,
       extraArgs: params.extraArgs,
       destinationName,
     },
     fileSystemExecutor,
   );
 
-  await handleTestLogic(
-    {
-      projectPath: params.projectPath,
-      workspacePath: params.workspacePath,
+  return {
+    configuration,
+    platform: inferred.platform,
+    preflight: preflight ?? undefined,
+    resolvedSimulatorId: simulatorResolution.simulatorId,
+    invocationRequest: {
       scheme: params.scheme,
-      simulatorId: simulatorResolution.simulatorId,
-      simulatorName: params.simulatorName,
-      configuration: params.configuration ?? 'Debug',
-      derivedDataPath: params.derivedDataPath,
-      extraArgs: params.extraArgs,
-      useLatestOS: false,
-      preferXcodebuild: params.preferXcodebuild ?? false,
+      configuration,
       platform: inferred.platform,
-      testRunnerEnv: params.testRunnerEnv,
-      progress: params.progress,
+      simulatorName: params.simulatorName,
+      simulatorId: params.simulatorId,
+      onlyTesting: preflight?.selectors.onlyTesting.map((selector) => selector.raw),
+      skipTesting: preflight?.selectors.skipTesting.map((selector) => selector.raw),
     },
-    executor,
-    {
-      preflight: preflight ?? undefined,
+    warningMessage:
+      params.simulatorId && params.useLatestOS !== undefined
+        ? 'useLatestOS parameter is ignored when using simulatorId (UUID implies exact device/OS)'
+        : undefined,
+  };
+}
+
+export function createTestSimExecutor(
+  executor: CommandExecutor,
+  fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
+  prepared?: PreparedTestSimExecution,
+): StreamingExecutor<TestSimulatorParams, TestSimulatorResult> {
+  return async (params, ctx) => {
+    const resolved =
+      prepared ?? (await prepareTestSimExecution(params, executor, fileSystemExecutor));
+
+    if (resolved.warningMessage) {
+      log('warn', resolved.warningMessage);
+      ctx.emitFragment({
+        kind: 'test-result',
+        fragment: 'warning',
+        message: resolved.warningMessage,
+      });
+    }
+
+    if (resolved.resolutionError || !resolved.resolvedSimulatorId) {
+      const started = createDomainStreamingPipeline('test_sim', 'TEST', ctx, 'test-result');
+      return createTestDomainResult({
+        started,
+        succeeded: false,
+        target: 'simulator',
+        artifacts: {
+          buildLogPath: started.pipeline.logPath,
+        },
+        fallbackErrorMessages: [
+          resolved.resolutionError ?? 'Failed to resolve simulator identifier for test execution.',
+        ],
+        request: resolved.invocationRequest,
+      });
+    }
+
+    const executeTest = createTestExecutor(executor, {
+      preflight: resolved.preflight,
       toolName: 'test_sim',
-    },
-  );
+      target: 'simulator',
+      request: resolved.invocationRequest,
+    });
+
+    return executeTest(
+      {
+        projectPath: params.projectPath,
+        workspacePath: params.workspacePath,
+        scheme: params.scheme,
+        simulatorId: resolved.resolvedSimulatorId,
+        simulatorName: params.simulatorName,
+        configuration: resolved.configuration,
+        derivedDataPath: params.derivedDataPath,
+        extraArgs: params.extraArgs,
+        useLatestOS: false,
+        preferXcodebuild: params.preferXcodebuild ?? false,
+        platform: resolved.platform,
+        testRunnerEnv: params.testRunnerEnv,
+        progress: params.progress,
+      },
+      ctx,
+    );
+  };
+}
+
+export async function test_simLogic(
+  params: TestSimulatorParams,
+  executor: CommandExecutor,
+  fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
+): Promise<void> {
+  const ctx = getHandlerContext();
+  const prepared = await prepareTestSimExecution(params, executor, fileSystemExecutor);
+
+  ctx.emit(createBuildInvocationFragment('test-result', 'TEST', prepared.invocationRequest));
+  const executionContext = createStreamingExecutionContext(ctx);
+  const executeTestSim = createTestSimExecutor(executor, fileSystemExecutor, prepared);
+  const result = await executeTestSim(params, executionContext);
+
+  setXcodebuildStructuredOutput(ctx, 'test-result', result);
 }
 
 const publicSchemaObject = baseSchemaObject.omit({
@@ -181,7 +276,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<TestSimulatorParams>({
-  internalSchema: testSimulatorSchema as unknown as z.ZodType<TestSimulatorParams, unknown>,
+  internalSchema: toInternalSchema<TestSimulatorParams>(testSimulatorSchema),
   logicFunction: (params, executor) =>
     test_simLogic(params, executor, getDefaultFileSystemExecutor()),
   getExecutor: getDefaultCommandExecutor,

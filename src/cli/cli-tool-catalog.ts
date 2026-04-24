@@ -6,12 +6,12 @@ import { buildCliToolCatalogFromManifest, createToolCatalog } from '../runtime/t
 import type { ToolCatalog, ToolDefinition } from '../runtime/types.ts';
 import { toKebabCase } from '../runtime/naming.ts';
 import type { ToolHandlerContext } from '../rendering/types.ts';
-import type { PipelineEvent } from '../types/pipeline-events.ts';
+
 import { jsonSchemaToZod } from '../integrations/xcode-tools-bridge/jsonschema-to-zod.ts';
 import { XcodeIdeToolService } from '../integrations/xcode-tools-bridge/tool-service.ts';
 import { toLocalToolName } from '../integrations/xcode-tools-bridge/registry.ts';
 import { log } from '../utils/logging/index.ts';
-import { statusLine } from '../utils/tool-event-builders.ts';
+import { infrastructureStatus } from '../types/runtime-status.ts';
 
 interface BuildCliToolCatalogOptions {
   socketPath: string;
@@ -64,15 +64,10 @@ async function invokeRemoteToolOneShot(
       isError?: boolean;
       _meta?: Record<string, unknown>;
     };
-    const events = response._meta?.events;
-    if (Array.isArray(events)) {
-      for (const event of events as PipelineEvent[]) {
-        ctx.emit(event);
-      }
-    } else if (response.content) {
+    if (response.content) {
       for (const item of response.content) {
         if (item.type === 'text') {
-          ctx.emit(statusLine(response.isError ? 'error' : 'success', item.text));
+          ctx.emit(infrastructureStatus(response.isError ? 'error' : 'success', item.text));
         }
       }
     }

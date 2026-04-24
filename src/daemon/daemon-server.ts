@@ -1,13 +1,16 @@
 import net from 'node:net';
 import { writeFrame, createFrameReader } from './framing.ts';
 import type { ToolCatalog } from '../runtime/types.ts';
-import type { PipelineEvent } from '../types/pipeline-events.ts';
 import type { ToolResponse } from '../types/common.ts';
+import type { AnyFragment } from '../types/domain-fragments.ts';
+import type { RuntimeStatusFragment } from '../types/runtime-status.ts';
 import type {
   DaemonRequest,
   DaemonResponse,
   DaemonToolResult,
   ToolInvokeParams,
+  ToolInvokeProgressFrame,
+  ToolInvokeResultFrame,
   DaemonStatusResult,
   ToolListItem,
   XcodeIdeListParams,
@@ -17,9 +20,8 @@ import type {
 } from './protocol.ts';
 import { DAEMON_PROTOCOL_VERSION } from './protocol.ts';
 import { DefaultToolInvoker } from '../runtime/tool-invoker.ts';
-import { createRenderSession } from '../rendering/render.ts';
 import type { ToolHandlerContext } from '../rendering/types.ts';
-import { statusLine } from '../utils/tool-event-builders.ts';
+
 import { log } from '../utils/logger.ts';
 import { XcodeIdeToolService } from '../integrations/xcode-tools-bridge/tool-service.ts';
 import { toLocalToolName } from '../integrations/xcode-tools-bridge/registry.ts';
@@ -42,21 +44,20 @@ export interface DaemonServerContext {
 }
 
 function toolResponseToDaemonResult(response: ToolResponse): DaemonToolResult {
-  const events: PipelineEvent[] = [];
-  const metaEvents = response._meta?.events;
-  if (Array.isArray(metaEvents) && metaEvents.length > 0) {
-    for (const event of metaEvents as PipelineEvent[]) {
-      events.push(event);
-    }
-  } else {
-    for (const item of response.content) {
-      if (item.type === 'text' && item.text) {
-        events.push(statusLine(response.isError ? 'error' : 'success', item.text));
-      }
+  const fragments: AnyFragment[] = [];
+  for (const item of response.content) {
+    if (item.type === 'text' && item.text) {
+      const statusFragment: RuntimeStatusFragment = {
+        kind: 'infrastructure',
+        fragment: 'status',
+        level: response.isError ? 'error' : 'success',
+        message: item.text,
+      };
+      fragments.push(statusFragment);
     }
   }
   return {
-    events,
+    ...(fragments.length > 0 ? { fragments } : {}),
     isError: response.isError === true,
     nextStepParams: response.nextStepParams,
     nextSteps: response.nextSteps,
@@ -144,27 +145,63 @@ export function startDaemonServer(ctx: DaemonServerContext): net.Server {
                 });
               }
 
+              const resolved = ctx.catalog.resolve(params.tool);
+              if (resolved.ambiguous) {
+                return writeFrame(socket, {
+                  ...base,
+                  error: {
+                    code: 'AMBIGUOUS_TOOL',
+                    message: `Ambiguous tool '${params.tool}'`,
+                    data: { matches: resolved.ambiguous },
+                  },
+                });
+              }
+
+              if (resolved.notFound || !resolved.tool) {
+                return writeFrame(socket, {
+                  ...base,
+                  error: {
+                    code: 'NOT_FOUND',
+                    message: `Unknown tool '${params.tool}'`,
+                  },
+                });
+              }
+
               log('info', `[Daemon] Invoking tool: ${params.tool}`);
-              const session = createRenderSession('text');
-              const handlerContext: ToolHandlerContext = {
-                emit: (event) => session.emit(event),
-                attach: (image) => session.attach(image),
+              const streamFragment = (fragment: AnyFragment): void => {
+                const frame: ToolInvokeProgressFrame = {
+                  v: DAEMON_PROTOCOL_VERSION,
+                  id: base.id,
+                  stream: { kind: 'fragment', fragment },
+                };
+                writeFrame(socket, frame);
               };
-              await invoker.invoke(params.tool, params.args ?? {}, {
+
+              const handlerContext: ToolHandlerContext = {
+                liveProgressEnabled: false,
+                streamingFragmentsEnabled: true,
+                emit: (fragment) => {
+                  streamFragment(fragment);
+                },
+                attach: () => {},
+              };
+
+              await invoker.invokeDirect(resolved.tool, params.args ?? {}, {
                 runtime: 'daemon',
-                renderSession: session,
                 handlerContext,
                 enabledWorkflows: ctx.enabledWorkflows,
               });
 
-              const daemonResult: DaemonToolResult = {
-                events: [...session.getEvents()],
-                isError: session.isError(),
-                nextStepParams: handlerContext.nextStepParams,
-                nextSteps: handlerContext.nextSteps,
+              const resultFrame: ToolInvokeResultFrame = {
+                v: DAEMON_PROTOCOL_VERSION,
+                id: base.id,
+                result: {
+                  structuredOutput: handlerContext.structuredOutput ?? null,
+                  nextStepParams: handlerContext.nextStepParams,
+                  nextSteps: handlerContext.nextSteps,
+                },
               };
-
-              return writeFrame(socket, { ...base, result: { result: daemonResult } });
+              return writeFrame(socket, resultFrame);
             }
 
             case 'xcode-ide.list': {

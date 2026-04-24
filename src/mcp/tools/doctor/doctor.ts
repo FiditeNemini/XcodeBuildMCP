@@ -5,19 +5,32 @@
  */
 
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { DoctorReportDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
 import { version } from '../../../utils/version/index.ts';
-import type { PipelineEvent } from '../../../types/pipeline-events.ts';
+import type {
+  HeaderRenderItem,
+  SectionRenderItem,
+  StatusRenderItem,
+} from '../../../rendering/render-items.ts';
+import {
+  formatHeaderEvent,
+  formatSectionEvent,
+  formatStatusLineEvent,
+} from '../../../utils/renderers/event-formatting.ts';
 import { createTypedTool, getHandlerContext } from '../../../utils/typed-tool-factory.ts';
 import { getConfig } from '../../../utils/config-store.ts';
 import { detectXcodeRuntime } from '../../../utils/xcode-process.ts';
 import { type DoctorDependencies, createDoctorDependencies } from './lib/doctor.deps.ts';
 import { peekXcodeToolsBridgeManager } from '../../../integrations/xcode-tools-bridge/index.ts';
 import { getMcpBridgeAvailability } from '../../../integrations/xcode-tools-bridge/core.ts';
-import { header, statusLine, section, detailTree } from '../../../utils/tool-event-builders.ts';
-import { renderEvents } from '../../../rendering/render.ts';
+
+import { toErrorMessage } from '../../../utils/errors.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
 
 const LOG_PREFIX = '[Doctor]';
 const USER_HOME_PATH_PATTERN = /\/Users\/[^/\s]+/g;
@@ -34,6 +47,9 @@ const doctorSchema = z.object({
 });
 
 type DoctorParams = z.infer<typeof doctorSchema>;
+type DoctorResult = DoctorReportDomainResult;
+
+const STRUCTURED_OUTPUT_SCHEMA = 'xcodebuildmcp.output.doctor-report';
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -160,6 +176,324 @@ async function getXcodeToolsBridgeDoctorInfo(
   }
 }
 
+async function collectDoctorData(params: DoctorParams, deps: DoctorDependencies) {
+  const xcodemakeEnabled = deps.features.isXcodemakeEnabled();
+  const requiredBinaries = ['axe', 'mise', ...(xcodemakeEnabled ? ['xcodemake'] : [])];
+  const binaryStatus: Record<string, { available: boolean; version?: string }> = {};
+  for (const binary of requiredBinaries) {
+    binaryStatus[binary] = await deps.binaryChecker.checkBinaryAvailability(binary);
+  }
+
+  const xcodeInfo = await deps.xcode.getXcodeInfo();
+  const envVars = deps.env.getEnvironmentVariables();
+  const systemInfo = deps.env.getSystemInfo();
+  const nodeInfo = deps.env.getNodeInfo();
+  const xcodeRuntime = await detectXcodeRuntime(deps.commandExecutor);
+  const axeAvailable = deps.features.areAxeToolsAvailable();
+  const manifestToolInfo = await deps.manifest.getManifestToolInfo();
+  const runtimeInfo = await deps.runtime.getRuntimeToolInfo();
+  const runtimeRegistration = runtimeInfo ?? {
+    enabledWorkflows: [],
+    registeredToolCount: 0,
+  };
+  const xcodeIdeWorkflowEnabled = runtimeRegistration.enabledWorkflows.includes('xcode-ide');
+  const runtimeNote = runtimeInfo ? null : 'Runtime registry unavailable.';
+  const xcodemakeBinaryAvailable = deps.features.isXcodemakeBinaryAvailable();
+  const makefileExists = xcodemakeEnabled ? deps.features.doesMakefileExist('./') : null;
+  const lldbDapAvailable = await checkLldbDapAvailability(deps.commandExecutor);
+  const selectedDebuggerBackend = getConfig().debuggerBackend;
+  const uiDebuggerGuardMode = getConfig().uiDebuggerGuardMode;
+  const dapSelected = selectedDebuggerBackend === 'dap';
+  const xcodeToolsBridge = await getXcodeToolsBridgeDoctorInfo(
+    deps.commandExecutor,
+    xcodeIdeWorkflowEnabled,
+  );
+  const axeVideoCaptureSupported =
+    axeAvailable && (await deps.features.isAxeAtLeastVersion('1.1.0', deps.commandExecutor));
+
+  const doctorInfoRaw = {
+    serverVersion: String(version),
+    timestamp: new Date().toISOString(),
+    system: systemInfo,
+    node: nodeInfo,
+    processTree: xcodeRuntime.processTree,
+    processTreeError: xcodeRuntime.error,
+    runningUnderXcode: xcodeRuntime.runningUnderXcode,
+    xcode: xcodeInfo,
+    dependencies: binaryStatus,
+    environmentVariables: envVars,
+    features: {
+      axe: {
+        available: axeAvailable,
+        uiAutomationSupported: axeAvailable,
+        videoCaptureSupported: axeVideoCaptureSupported,
+      },
+      xcodemake: {
+        enabled: xcodemakeEnabled,
+        binaryAvailable: xcodemakeBinaryAvailable,
+        makefileExists,
+      },
+      mise: {
+        running_under_mise: Boolean(process.env.XCODEBUILDMCP_RUNNING_UNDER_MISE),
+        available: binaryStatus['mise'].available,
+      },
+      debugger: {
+        dap: {
+          available: lldbDapAvailable,
+          selected: selectedDebuggerBackend,
+        },
+      },
+    },
+    manifestTools: manifestToolInfo,
+    xcodeToolsBridge,
+  } as const;
+
+  const currentCwdName = process.cwd().split('/').filter(Boolean).at(-1) ?? '';
+  const nodeCwdName = nodeInfo.cwd.split('/').filter(Boolean).at(-1) ?? '';
+  const projectNames = [currentCwdName, nodeCwdName].filter(
+    (name, index, all) => name.length > 0 && name !== '<redacted>' && all.indexOf(name) === index,
+  );
+  const piiTerms = [
+    envVars.USER,
+    systemInfo.username,
+    systemInfo.hostname,
+    process.env.USER,
+  ].filter((value, index, all): value is string => {
+    if (!value || value === '<redacted>') return false;
+    return all.indexOf(value) === index;
+  });
+
+  const doctorInfo = params.nonRedacted
+    ? doctorInfoRaw
+    : (sanitizeValue(doctorInfoRaw, '', projectNames, piiTerms) as typeof doctorInfoRaw);
+
+  return {
+    doctorInfo,
+    runtimeRegistration,
+    runtimeNote,
+    uiDebuggerGuardMode,
+    lldbDapAvailable,
+    dapSelected,
+  };
+}
+
+type DoctorCollectedData = Awaited<ReturnType<typeof collectDoctorData>>;
+
+function createDoctorChecks(data: DoctorCollectedData): DoctorResult['checks'] {
+  const checks: DoctorResult['checks'] = [];
+
+  if ('error' in data.doctorInfo.xcode) {
+    checks.push({
+      name: 'xcode',
+      status: 'error',
+      message: data.doctorInfo.xcode.error,
+    });
+  } else {
+    checks.push({
+      name: 'xcode',
+      status: 'ok',
+      message: `${data.doctorInfo.xcode.version} (${data.doctorInfo.xcode.path})`,
+    });
+  }
+
+  checks.push({
+    name: 'process-tree',
+    status: data.doctorInfo.processTreeError ? 'warning' : 'ok',
+    message: data.doctorInfo.processTreeError
+      ? `Running under Xcode: ${data.doctorInfo.runningUnderXcode ? 'Yes' : 'No'}; ${data.doctorInfo.processTreeError}`
+      : `Running under Xcode: ${data.doctorInfo.runningUnderXcode ? 'Yes' : 'No'}; ${data.doctorInfo.processTree.length} process entries`,
+  });
+
+  checks.push({
+    name: 'axe',
+    status: data.doctorInfo.features.axe.available ? 'ok' : 'warning',
+    message:
+      `Available: ${data.doctorInfo.features.axe.available ? 'Yes' : 'No'}; ` +
+      `UI automation: ${data.doctorInfo.features.axe.uiAutomationSupported ? 'Yes' : 'No'}; ` +
+      `Video capture: ${data.doctorInfo.features.axe.videoCaptureSupported ? 'Yes' : 'No'}`,
+  });
+
+  checks.push({
+    name: 'xcodemake',
+    status:
+      data.doctorInfo.features.xcodemake.enabled &&
+      !data.doctorInfo.features.xcodemake.binaryAvailable
+        ? 'warning'
+        : 'ok',
+    message:
+      `Enabled: ${data.doctorInfo.features.xcodemake.enabled ? 'Yes' : 'No'}; ` +
+      `Binary: ${data.doctorInfo.features.xcodemake.binaryAvailable ? 'Yes' : 'No'}; ` +
+      `Makefile: ${
+        data.doctorInfo.features.xcodemake.makefileExists === null
+          ? 'Not checked'
+          : data.doctorInfo.features.xcodemake.makefileExists
+            ? 'Yes'
+            : 'No'
+      }`,
+  });
+
+  checks.push({
+    name: 'mise',
+    status: data.doctorInfo.features.mise.available ? 'ok' : 'warning',
+    message:
+      `Running under mise: ${data.doctorInfo.features.mise.running_under_mise ? 'Yes' : 'No'}; ` +
+      `Available: ${data.doctorInfo.features.mise.available ? 'Yes' : 'No'}`,
+  });
+
+  checks.push({
+    name: 'debugger-dap',
+    status: data.dapSelected && !data.lldbDapAvailable ? 'warning' : 'ok',
+    message:
+      `Selected backend: ${data.doctorInfo.features.debugger.dap.selected}; ` +
+      `lldb-dap available: ${data.doctorInfo.features.debugger.dap.available ? 'Yes' : 'No'}`,
+  });
+
+  if ('error' in data.doctorInfo.manifestTools) {
+    checks.push({
+      name: 'manifest-tools',
+      status: 'error',
+      message: data.doctorInfo.manifestTools.error,
+    });
+  } else {
+    checks.push({
+      name: 'manifest-tools',
+      status: 'ok',
+      message:
+        `Total tools: ${data.doctorInfo.manifestTools.totalTools}; ` +
+        `Workflows: ${data.doctorInfo.manifestTools.workflowCount}`,
+    });
+  }
+
+  checks.push({
+    name: 'runtime-registration',
+    status: data.runtimeNote ? 'warning' : 'ok',
+    message: data.runtimeNote
+      ? data.runtimeNote
+      : `Enabled workflows: ${data.runtimeRegistration.enabledWorkflows.join(', ') || '(none)'}; Registered tools: ${data.runtimeRegistration.registeredToolCount}`,
+  });
+
+  if (data.doctorInfo.xcodeToolsBridge.available) {
+    checks.push({
+      name: 'xcode-ide-bridge',
+      status: data.doctorInfo.xcodeToolsBridge.lastError ? 'warning' : 'ok',
+      message:
+        `Workflow enabled: ${data.doctorInfo.xcodeToolsBridge.workflowEnabled ? 'Yes' : 'No'}; ` +
+        `Connected: ${data.doctorInfo.xcodeToolsBridge.connected ? 'Yes' : 'No'}; ` +
+        `Proxied tools: ${data.doctorInfo.xcodeToolsBridge.proxiedToolCount}`,
+    });
+  } else {
+    checks.push({
+      name: 'xcode-ide-bridge',
+      status: 'warning',
+      message: data.doctorInfo.xcodeToolsBridge.reason,
+    });
+  }
+
+  checks.push({
+    name: 'sentry',
+    status: 'ok',
+    message: `Enabled: ${data.doctorInfo.environmentVariables.SENTRY_DISABLED !== 'true' ? 'Yes' : 'No'}`,
+  });
+
+  return checks;
+}
+
+function createDoctorResult(data: DoctorCollectedData): DoctorResult {
+  return {
+    kind: 'doctor-report',
+    didError: false,
+    error: null,
+    serverVersion: data.doctorInfo.serverVersion,
+    checks: createDoctorChecks(data),
+  };
+}
+
+function createDoctorErrorResult(message: string): DoctorResult {
+  return {
+    kind: 'doctor-report',
+    didError: true,
+    error: 'Doctor failed.',
+    diagnostics: createBasicDiagnostics({ errors: [message] }),
+    serverVersion: String(version),
+    checks: [],
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: DoctorResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: STRUCTURED_OUTPUT_SCHEMA,
+    schemaVersion: '1',
+  };
+}
+
+export function createDoctorExecutor(
+  deps: DoctorDependencies,
+): NonStreamingExecutor<DoctorParams, DoctorResult> {
+  return async (params) => {
+    try {
+      const data = await collectDoctorData(params, deps);
+      return createDoctorResult(data);
+    } catch (error) {
+      const message = toErrorMessage(error);
+      return createDoctorErrorResult(message);
+    }
+  };
+}
+
+type DoctorRenderItem = HeaderRenderItem | SectionRenderItem | StatusRenderItem;
+
+function doctorHeader(
+  operation: string,
+  params: Array<{ label: string; value: string }>,
+): HeaderRenderItem {
+  return { type: 'header', operation, params };
+}
+
+function doctorSection(
+  title: string,
+  lines: string[],
+  opts?: { icon?: SectionRenderItem['icon']; blankLineAfterTitle?: boolean },
+): SectionRenderItem {
+  return {
+    type: 'section',
+    title,
+    lines,
+    ...(opts?.icon ? { icon: opts.icon } : {}),
+    ...(opts?.blankLineAfterTitle ? { blankLineAfterTitle: opts.blankLineAfterTitle } : {}),
+  };
+}
+
+function doctorStatus(level: StatusRenderItem['level'], message: string): StatusRenderItem {
+  return { type: 'status', level, message };
+}
+
+function renderDoctorItems(items: DoctorRenderItem[]): string {
+  let output = '';
+  let lastType: string | null = null;
+  for (const item of items) {
+    switch (item.type) {
+      case 'header':
+        output += `\n${formatHeaderEvent(item)}\n`;
+        break;
+      case 'section':
+        output += `\n${formatSectionEvent(item)}\n`;
+        break;
+      case 'status': {
+        const compact = lastType === 'status' || lastType === 'summary';
+        if (compact) {
+          output += `${formatStatusLineEvent(item)}\n`;
+        } else {
+          output += `\n${formatStatusLineEvent(item)}\n`;
+        }
+        break;
+      }
+    }
+    lastType = item.type;
+  }
+  return output;
+}
+
 /**
  * Run the doctor tool and return the results.
  */
@@ -168,98 +502,17 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
   process.env.XCODEBUILDMCP_SILENCE_LOGS = 'true';
   log('info', `${LOG_PREFIX}: Running doctor tool`);
   try {
-    const xcodemakeEnabled = deps.features.isXcodemakeEnabled();
-    const requiredBinaries = ['axe', 'mise', ...(xcodemakeEnabled ? ['xcodemake'] : [])];
-    const binaryStatus: Record<string, { available: boolean; version?: string }> = {};
-    for (const binary of requiredBinaries) {
-      binaryStatus[binary] = await deps.binaryChecker.checkBinaryAvailability(binary);
-    }
+    const {
+      doctorInfo,
+      runtimeRegistration,
+      runtimeNote,
+      uiDebuggerGuardMode,
+      lldbDapAvailable,
+      dapSelected,
+    } = await collectDoctorData(params, deps);
 
-    const xcodeInfo = await deps.xcode.getXcodeInfo();
-    const envVars = deps.env.getEnvironmentVariables();
-    const systemInfo = deps.env.getSystemInfo();
-    const nodeInfo = deps.env.getNodeInfo();
-    const xcodeRuntime = await detectXcodeRuntime(deps.commandExecutor);
-    const axeAvailable = deps.features.areAxeToolsAvailable();
-    const manifestToolInfo = await deps.manifest.getManifestToolInfo();
-    const runtimeInfo = await deps.runtime.getRuntimeToolInfo();
-    const runtimeRegistration = runtimeInfo ?? {
-      enabledWorkflows: [],
-      registeredToolCount: 0,
-    };
-    const xcodeIdeWorkflowEnabled = runtimeRegistration.enabledWorkflows.includes('xcode-ide');
-    const runtimeNote = runtimeInfo ? null : 'Runtime registry unavailable.';
-    const xcodemakeBinaryAvailable = deps.features.isXcodemakeBinaryAvailable();
-    const makefileExists = xcodemakeEnabled ? deps.features.doesMakefileExist('./') : null;
-    const lldbDapAvailable = await checkLldbDapAvailability(deps.commandExecutor);
-    const selectedDebuggerBackend = getConfig().debuggerBackend;
-    const uiDebuggerGuardMode = getConfig().uiDebuggerGuardMode;
-    const dapSelected = selectedDebuggerBackend === 'dap';
-    const xcodeToolsBridge = await getXcodeToolsBridgeDoctorInfo(
-      deps.commandExecutor,
-      xcodeIdeWorkflowEnabled,
-    );
-    const axeVideoCaptureSupported =
-      axeAvailable && (await deps.features.isAxeAtLeastVersion('1.1.0', deps.commandExecutor));
-
-    const doctorInfoRaw = {
-      serverVersion: String(version),
-      timestamp: new Date().toISOString(),
-      system: systemInfo,
-      node: nodeInfo,
-      processTree: xcodeRuntime.processTree,
-      processTreeError: xcodeRuntime.error,
-      runningUnderXcode: xcodeRuntime.runningUnderXcode,
-      xcode: xcodeInfo,
-      dependencies: binaryStatus,
-      environmentVariables: envVars,
-      features: {
-        axe: {
-          available: axeAvailable,
-          uiAutomationSupported: axeAvailable,
-          videoCaptureSupported: axeVideoCaptureSupported,
-        },
-        xcodemake: {
-          enabled: xcodemakeEnabled,
-          binaryAvailable: xcodemakeBinaryAvailable,
-          makefileExists,
-        },
-        mise: {
-          running_under_mise: Boolean(process.env.XCODEBUILDMCP_RUNNING_UNDER_MISE),
-          available: binaryStatus['mise'].available,
-        },
-        debugger: {
-          dap: {
-            available: lldbDapAvailable,
-            selected: selectedDebuggerBackend,
-          },
-        },
-      },
-      manifestTools: manifestToolInfo,
-      xcodeToolsBridge,
-    } as const;
-
-    const currentCwdName = process.cwd().split('/').filter(Boolean).at(-1) ?? '';
-    const nodeCwdName = nodeInfo.cwd.split('/').filter(Boolean).at(-1) ?? '';
-    const projectNames = [currentCwdName, nodeCwdName].filter(
-      (name, index, all) => name.length > 0 && name !== '<redacted>' && all.indexOf(name) === index,
-    );
-    const piiTerms = [
-      envVars.USER,
-      systemInfo.username,
-      systemInfo.hostname,
-      process.env.USER,
-    ].filter((value, index, all): value is string => {
-      if (!value || value === '<redacted>') return false;
-      return all.indexOf(value) === index;
-    });
-
-    const doctorInfo = params.nonRedacted
-      ? doctorInfoRaw
-      : (sanitizeValue(doctorInfoRaw, '', projectNames, piiTerms) as typeof doctorInfoRaw);
-
-    const events: PipelineEvent[] = [
-      header('XcodeBuildMCP Doctor', [
+    const items: DoctorRenderItem[] = [
+      doctorHeader('XcodeBuildMCP Doctor', [
         { label: 'Generated', value: doctorInfo.timestamp },
         { label: 'Server Version', value: doctorInfo.serverVersion },
         {
@@ -270,18 +523,16 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     ];
 
     // System Information
-    events.push(
-      detailTree(
-        Object.entries(doctorInfo.system).map(([key, value]) => ({
-          label: key,
-          value: String(value),
-        })),
+    items.push(
+      doctorSection(
+        'System Information',
+        Object.entries(doctorInfo.system).map(([key, value]) => `${key}: ${value}`),
       ),
     );
 
     // Node.js Information
-    events.push(
-      section(
+    items.push(
+      doctorSection(
         'Node.js Information',
         Object.entries(doctorInfo.node).map(([key, value]) => `${key}: ${value}`),
       ),
@@ -303,16 +554,16 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     if (doctorInfo.processTreeError) {
       processTreeLines.push(`Error: ${doctorInfo.processTreeError}`);
     }
-    events.push(section('Process Tree', processTreeLines));
+    items.push(doctorSection('Process Tree', processTreeLines));
 
     // Xcode Information
     if ('error' in doctorInfo.xcode) {
-      events.push(
-        section('Xcode Information', [`Error: ${doctorInfo.xcode.error}`], { icon: 'cross' }),
+      items.push(
+        doctorSection('Xcode Information', [`Error: ${doctorInfo.xcode.error}`], { icon: 'cross' }),
       );
     } else {
-      events.push(
-        section(
+      items.push(
+        doctorSection(
           'Xcode Information',
           Object.entries(doctorInfo.xcode).map(([key, value]) => `${key}: ${value}`),
         ),
@@ -320,8 +571,8 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     }
 
     // Dependencies
-    events.push(
-      section(
+    items.push(
+      doctorSection(
         'Dependencies',
         Object.entries(doctorInfo.dependencies).map(
           ([binary, status]) =>
@@ -334,11 +585,11 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     const envLines = Object.entries(doctorInfo.environmentVariables)
       .filter(([key]) => key !== 'PATH' && key !== 'PYTHONPATH')
       .map(([key, value]) => `${key}: ${value ?? '(not set)'}`);
-    events.push(section('Environment Variables', envLines));
+    items.push(doctorSection('Environment Variables', envLines));
 
     // PATH
     const pathValue = doctorInfo.environmentVariables.PATH ?? '(not set)';
-    events.push(section('PATH', pathValue.split(':')));
+    items.push(doctorSection('PATH', pathValue.split(':')));
 
     // UI Automation (axe)
     const axeLines: string[] = [
@@ -347,7 +598,7 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
       `Simulator Video Capture Supported (AXe >= 1.1.0): ${doctorInfo.features.axe.videoCaptureSupported ? 'Yes' : 'No'}`,
       `UI-Debugger Guard Mode: ${uiDebuggerGuardMode}`,
     ];
-    events.push(section('UI Automation (axe)', axeLines));
+    items.push(doctorSection('UI Automation (axe)', axeLines));
 
     // Incremental Builds
     let makefileStatus: string;
@@ -356,8 +607,8 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     } else {
       makefileStatus = doctorInfo.features.xcodemake.makefileExists ? 'Yes' : 'No';
     }
-    events.push(
-      section('Incremental Builds', [
+    items.push(
+      doctorSection('Incremental Builds', [
         `Enabled: ${doctorInfo.features.xcodemake.enabled ? 'Yes' : 'No'}`,
         `xcodemake Binary Available: ${doctorInfo.features.xcodemake.binaryAvailable ? 'Yes' : 'No'}`,
         `Makefile exists (cwd): ${makefileStatus}`,
@@ -365,8 +616,8 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     );
 
     // Mise Integration
-    events.push(
-      section('Mise Integration', [
+    items.push(
+      doctorSection('Mise Integration', [
         `Running under mise: ${doctorInfo.features.mise.running_under_mise ? 'Yes' : 'No'}`,
         `Mise available: ${doctorInfo.features.mise.available ? 'Yes' : 'No'}`,
       ]),
@@ -382,18 +633,18 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
         'Warning: DAP backend selected but lldb-dap not available. Set XCODEBUILDMCP_DEBUGGER_BACKEND=lldb-cli to use the CLI backend.',
       );
     }
-    events.push(section('Debugger Backend (DAP)', debuggerLines));
+    items.push(doctorSection('Debugger Backend (DAP)', debuggerLines));
 
     // Manifest Tool Inventory
     if ('error' in doctorInfo.manifestTools) {
-      events.push(
-        section('Manifest Tool Inventory', [`Error: ${doctorInfo.manifestTools.error}`], {
+      items.push(
+        doctorSection('Manifest Tool Inventory', [`Error: ${doctorInfo.manifestTools.error}`], {
           icon: 'cross',
         }),
       );
     } else {
-      events.push(
-        section('Manifest Tool Inventory', [
+      items.push(
+        doctorSection('Manifest Tool Inventory', [
           `Total Unique Tools: ${doctorInfo.manifestTools.totalTools}`,
           `Workflow Count: ${doctorInfo.manifestTools.workflowCount}`,
           ...Object.entries(doctorInfo.manifestTools.toolsByWorkflow).map(
@@ -414,12 +665,12 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     if (runtimeRegistration.enabledWorkflows.length > 0) {
       runtimeLines.push(`Workflows: ${runtimeRegistration.enabledWorkflows.join(', ')}`);
     }
-    events.push(section('Runtime Tool Registration', runtimeLines));
+    items.push(doctorSection('Runtime Tool Registration', runtimeLines));
 
     // Xcode IDE Bridge
     if (doctorInfo.xcodeToolsBridge.available) {
-      events.push(
-        section('Xcode IDE Bridge (mcpbridge)', [
+      items.push(
+        doctorSection('Xcode IDE Bridge (mcpbridge)', [
           `Workflow enabled: ${doctorInfo.xcodeToolsBridge.workflowEnabled ? 'Yes' : 'No'}`,
           `mcpbridge path: ${doctorInfo.xcodeToolsBridge.bridgePath ?? '(not found)'}`,
           `Xcode running: ${doctorInfo.xcodeToolsBridge.xcodeRunning ?? '(unknown)'}`,
@@ -431,8 +682,8 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
         ]),
       );
     } else {
-      events.push(
-        section('Xcode IDE Bridge (mcpbridge)', [
+      items.push(
+        doctorSection('Xcode IDE Bridge (mcpbridge)', [
           `Unavailable: ${doctorInfo.xcodeToolsBridge.reason}`,
         ]),
       );
@@ -448,8 +699,8 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     } else {
       incrementalStatus = 'Not available';
     }
-    events.push(
-      section('Tool Availability Summary', [
+    items.push(
+      doctorSection('Tool Availability Summary', [
         `Build Tools: ${buildToolsAvailable ? 'Available' : 'Not available'}`,
         `UI Automation Tools: ${doctorInfo.features.axe.uiAutomationSupported ? 'Available' : 'Not available'}`,
         `Incremental Build Support: ${incrementalStatus}`,
@@ -457,15 +708,15 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
     );
 
     // Sentry
-    events.push(
-      section('Sentry', [
+    items.push(
+      doctorSection('Sentry', [
         `Sentry enabled: ${doctorInfo.environmentVariables.SENTRY_DISABLED !== 'true' ? 'Yes' : 'No'}`,
       ]),
     );
 
     // Troubleshooting Tips
-    events.push(
-      section('Troubleshooting Tips', [
+    items.push(
+      doctorSection('Troubleshooting Tips', [
         'If UI automation tools are not available, install axe: brew tap cameroncooke/axe && brew install axe',
         'If incremental build support is not available, install xcodemake (https://github.com/cameroncooke/xcodemake) and ensure it is executable and available in your PATH',
         'To enable xcodemake, set environment variable: export INCREMENTAL_BUILDS_ENABLED=1',
@@ -473,18 +724,13 @@ export async function runDoctor(params: DoctorParams, deps: DoctorDependencies) 
       ]),
     );
 
-    events.push(statusLine('success', 'Doctor diagnostics complete'));
+    items.push(doctorStatus('success', 'Doctor diagnostics complete'));
 
-    const rendered = renderEvents(events, 'text');
-    const hasError = events.some(
-      (e) =>
-        (e.type === 'status-line' && e.level === 'error') ||
-        (e.type === 'summary' && e.status === 'FAILED'),
-    );
+    const rendered = renderDoctorItems(items);
+    const hasError = items.some((e) => e.type === 'status' && e.level === 'error');
     return {
       content: [{ type: 'text' as const, text: rendered }],
       isError: hasError || undefined,
-      _meta: { events: [...events] },
     };
   } finally {
     if (prevSilence === undefined) {
@@ -505,14 +751,11 @@ export async function doctorToolLogic(
   executor: CommandExecutor,
 ): Promise<void> {
   const ctx = getHandlerContext();
-  const response = await doctorLogic(params, executor);
+  const deps = createDoctorDependencies(executor);
+  const executeDoctor = createDoctorExecutor(deps);
+  const result = await executeDoctor(params);
 
-  const events = response._meta?.events;
-  if (Array.isArray(events)) {
-    for (const event of events as PipelineEvent[]) {
-      ctx.emit(event);
-    }
-  }
+  setStructuredOutput(ctx, result);
 }
 
 export const schema = doctorSchema.shape;

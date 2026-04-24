@@ -13,7 +13,7 @@ const runBuildRunMacOSLogic = (
 
 function expectPendingBuildRunResponse(result: MockToolHandlerResult, isError: boolean): void {
   expect(result.isError()).toBe(isError);
-  expect(result.events.some((event) => event.type === 'summary')).toBe(true);
+  expect(result.text()).not.toHaveLength(0);
 }
 
 describe('build_run_macos', () => {
@@ -124,6 +124,8 @@ describe('build_run_macos', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=macOS',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',
@@ -132,25 +134,10 @@ describe('build_run_macos', () => {
 
       expectPendingBuildRunResponse(result, false);
       expect(result.nextStepParams).toBeUndefined();
-      expect(result.events).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            type: 'status-line',
-            level: 'success',
-            message: 'Build & Run complete',
-          }),
-          expect.objectContaining({
-            type: 'detail-tree',
-            items: expect.arrayContaining([
-              expect.objectContaining({ label: 'App Path', value: '/path/to/build/MyApp.app' }),
-              expect.objectContaining({
-                label: 'Build Logs',
-                value: expect.stringContaining('build_run_macos_'),
-              }),
-            ]),
-          }),
-        ]),
-      );
+      const text = result.text();
+      expect(text).toContain('Build & Run complete');
+      expect(text).toContain('/path/to/build/MyApp.app');
+      expect(text).toContain('build_run_macos_');
     });
 
     it('should successfully build and run macOS app from workspace', async () => {
@@ -205,6 +192,8 @@ describe('build_run_macos', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=macOS',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',
@@ -406,6 +395,8 @@ describe('build_run_macos', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=macOS',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',

@@ -16,7 +16,7 @@ export function registerUiAutomationSnapshotSuite(runtime: SnapshotRuntime): voi
 
     beforeAll(async () => {
       vi.setConfig({ testTimeout: 120_000 });
-      simulatorUdid = await ensureSimulatorBooted('iPhone 17');
+      simulatorUdid = await ensureSimulatorBooted('iPhone 17 Pro');
       harness = await createHarnessForRuntime(runtime);
 
       await harness.invoke('simulator', 'build-and-run', {
@@ -232,6 +232,15 @@ export function registerUiAutomationSnapshotSuite(runtime: SnapshotRuntime): voi
 
     describe('snapshot-ui', () => {
       it('success - calculator app', async () => {
+        // Re-focus the calculator app before snapshotting: preceding UI tests
+        // (hardware button presses, gestures) can leave the app backgrounded,
+        // which makes the root Application's AXLabel volatile across runs.
+        await harness.invoke('simulator', 'launch-app', {
+          simulatorId: simulatorUdid,
+          bundleId: BUNDLE_ID,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
         const { text, isError } = await harness.invoke('ui-automation', 'snapshot-ui', {
           simulatorId: simulatorUdid,
         });

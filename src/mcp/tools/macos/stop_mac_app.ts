@@ -1,10 +1,17 @@
 import * as z from 'zod';
+import type { StopResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
 import { createTypedTool, getHandlerContext } from '../../../utils/typed-tool-factory.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+import {
+  buildStopFailure,
+  buildStopSuccess,
+  setStopResultStructuredOutput,
+  type StopResultArtifacts,
+} from '../../../utils/app-lifecycle-results.ts';
 
 const stopMacAppSchema = z.object({
   appName: z.string().optional(),
@@ -12,58 +19,72 @@ const stopMacAppSchema = z.object({
 });
 
 type StopMacAppParams = z.infer<typeof stopMacAppSchema>;
+type StopMacAppResult = StopResultDomainResult;
 
 export async function stop_mac_appLogic(
   params: StopMacAppParams,
   executor: CommandExecutor,
 ): Promise<void> {
-  if (!params.appName && !params.processId) {
-    const ctx = getHandlerContext();
-    ctx.emit(header('Stop macOS App'));
-    ctx.emit(statusLine('error', 'Either appName or processId must be provided.'));
+  const ctx = getHandlerContext();
+  const executeStopMacApp = createStopMacAppExecutor(executor);
+  const result = await executeStopMacApp(params);
+
+  setStopResultStructuredOutput(ctx, result);
+
+  if (result.didError) {
+    log('error', `Error stopping macOS app: ${result.error ?? 'Unknown error'}`);
     return;
   }
+}
 
-  const target = params.processId ? `PID ${params.processId}` : params.appName!;
-  const headerEvent = header('Stop macOS App', [{ label: 'App', value: target }]);
+function createStopMacAppArtifacts(params: StopMacAppParams): StopResultArtifacts {
+  if (params.processId !== undefined && params.appName) {
+    return { processId: params.processId, appName: params.appName };
+  }
+  if (params.processId !== undefined) {
+    return { processId: params.processId, appName: `PID ${params.processId}` };
+  }
+  if (params.appName) {
+    return { appName: params.appName };
+  }
+  return { appName: '' };
+}
 
-  log('info', `Stopping macOS app: ${target}`);
+export function createStopMacAppExecutor(
+  executor: CommandExecutor,
+): NonStreamingExecutor<StopMacAppParams, StopMacAppResult> {
+  return async (params) => {
+    const artifacts = createStopMacAppArtifacts(params);
 
-  const ctx = getHandlerContext();
+    if (!params.appName && params.processId === undefined) {
+      return buildStopFailure(artifacts, 'Either appName or processId must be provided.');
+    }
 
-  return withErrorHandling(
-    ctx,
-    async () => {
-      let command: string[];
+    const target = params.processId ? `PID ${params.processId}` : params.appName!;
+    log('info', `Stopping macOS app: ${target}`);
 
-      if (params.processId) {
-        command = ['kill', String(params.processId)];
-      } else {
-        command = ['pkill', '-f', params.appName!];
-      }
-
+    try {
+      const command =
+        params.processId !== undefined
+          ? ['kill', String(params.processId)]
+          : ['pkill', '-f', params.appName!];
       const result = await executor(command, 'Stop macOS App');
 
       if (!result.success) {
-        ctx.emit(headerEvent);
-        ctx.emit(
-          statusLine(
-            'error',
-            `Stop macOS app operation failed: ${result.error ?? 'Unknown error'}`,
-          ),
+        return buildStopFailure(
+          artifacts,
+          `Stop macOS app operation failed: ${result.error ?? 'Unknown error'}`,
         );
-        return;
       }
 
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('success', 'App stopped successfully'));
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Stop macOS app operation failed: ${message}`,
-      logMessage: ({ message }) => `Error stopping macOS app: ${message}`,
-    },
-  );
+      return buildStopSuccess(artifacts);
+    } catch (error) {
+      return buildStopFailure(
+        artifacts,
+        `Stop macOS app operation failed: ${toErrorMessage(error)}`,
+      );
+    }
+  };
 }
 
 export const schema = stopMacAppSchema.shape;

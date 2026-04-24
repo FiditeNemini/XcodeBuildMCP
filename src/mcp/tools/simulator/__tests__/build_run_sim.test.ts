@@ -31,7 +31,7 @@ const runBuildRunSimLogic = (
 
 function expectPendingBuildRunResponse(result: MockToolHandlerResult, isError: boolean): void {
   expect(result.isError()).toBe(isError);
-  expect(result.events.some((event) => event.type === 'summary')).toBe(true);
+  expect(result.text()).not.toBe('');
 }
 
 describe('build_run_sim tool', () => {
@@ -229,26 +229,12 @@ describe('build_run_sim tool', () => {
       );
 
       expectPendingBuildRunResponse(result, false);
-      expect(result.events).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            type: 'status-line',
-            level: 'success',
-            message: 'Build & Run complete',
-          }),
-          expect.objectContaining({
-            type: 'detail-tree',
-            items: expect.arrayContaining([
-              expect.objectContaining({ label: 'App Path', value: '/path/to/build/MyApp.app' }),
-              expect.objectContaining({ label: 'Bundle ID', value: 'io.sentry.MyApp' }),
-              expect.objectContaining({
-                label: 'Build Logs',
-                value: expect.stringContaining('build_run_sim_'),
-              }),
-            ]),
-          }),
-        ]),
-      );
+      const text = result.text();
+      expect(text).toContain('Build & Run complete');
+      expect(text).toContain('/path/to/build/MyApp.app');
+      expect(text).toContain('io.sentry.MyApp');
+      expect(text).toContain('99999');
+      expect(text).toContain('build_run_sim_');
     });
 
     it('should handle install failure as pending error', async () => {
@@ -381,6 +367,8 @@ describe('build_run_sim tool', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=iOS Simulator,name=iPhone 17,OS=latest',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',
@@ -438,6 +426,8 @@ describe('build_run_sim tool', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=iOS Simulator,name=iPhone 17,OS=latest',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',
@@ -503,6 +493,8 @@ describe('build_run_sim tool', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=iOS Simulator,name=iPhone 17',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',
@@ -550,6 +542,8 @@ describe('build_run_sim tool', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',
@@ -582,6 +576,8 @@ describe('build_run_sim tool', () => {
         '-skipMacroValidation',
         '-destination',
         'platform=tvOS Simulator,name=Apple TV 4K,OS=latest',
+        '-collect-test-diagnostics',
+        'never',
         '-derivedDataPath',
         DERIVED_DATA_DIR,
         'build',

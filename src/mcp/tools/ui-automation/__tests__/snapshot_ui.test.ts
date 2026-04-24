@@ -89,9 +89,9 @@ describe('Snapshot UI Plugin', () => {
       expect(result.isError).toBeFalsy();
       const text = allText(result);
       expect(text).toContain('Accessibility hierarchy retrieved successfully.');
-      expect(text).toContain(
-        '{"elements": [{"type": "Button", "frame": {"x": 100, "y": 200, "width": 50, "height": 30}}]}',
-      );
+      expect(text).toContain('Accessibility Hierarchy');
+      expect(text).toContain('"type" : "Button"');
+      expect(text).toContain('"width" : 50');
       expect(text).toContain('Use frame coordinates for tap/swipe');
       expect(result.nextStepParams).toEqual({
         snapshot_ui: { simulatorId: '12345678-1234-4234-8234-123456789012' },
@@ -146,9 +146,9 @@ describe('Snapshot UI Plugin', () => {
       );
 
       expect(result.isError).toBe(true);
-      expect(allText(result)).toContain(
-        "Failed to get accessibility hierarchy: axe command 'describe-ui' failed.",
-      );
+      const text = allText(result);
+      expect(text).toContain('Failed to get accessibility hierarchy.');
+      expect(text).toContain('axe command failed');
     });
 
     it('should handle SystemError from command execution', async () => {
@@ -215,9 +215,9 @@ describe('Snapshot UI Plugin', () => {
       );
 
       expect(result.isError).toBe(true);
-      expect(allText(result)).toContain(
-        'System error executing axe: Failed to execute axe command: String error',
-      );
+      const text = allText(result);
+      expect(text).toContain('System error executing axe command.');
+      expect(text).toContain('Failed to execute axe command: String error');
     });
   });
 });

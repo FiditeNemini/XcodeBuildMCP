@@ -1,13 +1,17 @@
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { DebugSessionActionDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
 import { log } from '../../../utils/logging/index.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, detailTree, section } from '../../../utils/tool-event-builders.ts';
-import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+import { nullifyEmptyStrings, withSimulatorIdOrName } from '../../../utils/schema-helpers.ts';
 import { determineSimulatorUuid } from '../../../utils/simulator-utils.ts';
 import {
   createSessionAwareToolWithContext,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
 import {
   getDefaultDebuggerToolContext,
@@ -41,13 +45,7 @@ const baseSchemaObject = z.object({
 
 const debugAttachSchema = z.preprocess(
   nullifyEmptyStrings,
-  baseSchemaObject
-    .refine((val) => val.simulatorId !== undefined || val.simulatorName !== undefined, {
-      message: 'Either simulatorId or simulatorName is required.',
-    })
-    .refine((val) => !(val.simulatorId && val.simulatorName), {
-      message: 'simulatorId and simulatorName are mutually exclusive. Provide only one.',
-    })
+  withSimulatorIdOrName(baseSchemaObject)
     .refine((val) => val.bundleId !== undefined || val.pid !== undefined, {
       message: 'Provide either bundleId or pid to attach.',
     })
@@ -57,60 +55,116 @@ const debugAttachSchema = z.preprocess(
 );
 
 export type DebugAttachSimParams = z.infer<typeof debugAttachSchema>;
+type DebugAttachSimResult = DebugSessionActionDomainResult;
 
-export async function debug_attach_simLogic(
-  params: DebugAttachSimParams,
-  ctx: DebuggerToolContext,
-): Promise<void> {
-  const { executor, debugger: debuggerManager } = ctx;
-  const headerEvent = header('Attach Debugger');
-  const handlerCtx = getHandlerContext();
+function createDebugAttachResult(params: {
+  didError: boolean;
+  error?: string;
+  diagnosticMessage?: string;
+  debugSessionId?: string;
+  executionState?: 'paused' | 'running';
+  simulatorId?: string;
+  processId?: number;
+}): DebugAttachSimResult {
+  const artifacts =
+    params.simulatorId && typeof params.processId === 'number'
+      ? { simulatorId: params.simulatorId, processId: params.processId }
+      : params.simulatorId
+        ? { simulatorId: params.simulatorId }
+        : typeof params.processId === 'number'
+          ? { processId: params.processId }
+          : undefined;
 
-  const simResult = await determineSimulatorUuid(
-    { simulatorId: params.simulatorId, simulatorName: params.simulatorName },
-    executor,
-  );
+  return {
+    kind: 'debug-session-action',
+    didError: params.didError,
+    error: params.error ?? null,
+    ...(params.didError
+      ? {
+          diagnostics: createBasicDiagnostics({
+            errors: [params.diagnosticMessage ?? params.error ?? 'Unknown error'],
+          }),
+        }
+      : {}),
+    action: 'attach',
+    ...(params.debugSessionId
+      ? {
+          session: {
+            debugSessionId: params.debugSessionId,
+            connectionState: 'attached',
+            ...(params.executionState ? { executionState: params.executionState } : {}),
+          },
+        }
+      : {}),
+    ...(artifacts ? { artifacts } : {}),
+  };
+}
 
-  if (simResult.error) {
-    handlerCtx.emit(headerEvent);
-    handlerCtx.emit(statusLine('error', simResult.error));
-    return;
-  }
+function setStructuredOutput(ctx: ToolHandlerContext, result: DebugAttachSimResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.debug-session-action',
+    schemaVersion: '1',
+  };
+}
 
-  const simulatorId = simResult.uuid;
-  if (!simulatorId) {
-    handlerCtx.emit(headerEvent);
-    handlerCtx.emit(
-      statusLine('error', 'Simulator resolution failed: Unable to determine simulator UUID'),
+export function createDebugAttachSimExecutor(
+  toolContext: DebuggerToolContext,
+): NonStreamingExecutor<DebugAttachSimParams, DebugAttachSimResult> {
+  return async (params) => {
+    const { executor, debugger: debuggerManager } = toolContext;
+
+    const simResult = await determineSimulatorUuid(
+      { simulatorId: params.simulatorId, simulatorName: params.simulatorName },
+      executor,
     );
-    return;
-  }
 
-  let pid = params.pid;
-  if (!pid && params.bundleId) {
-    try {
-      pid = await resolveSimulatorAppPid({
-        executor,
-        simulatorId,
-        bundleId: params.bundleId,
+    if (simResult.error) {
+      return createDebugAttachResult({
+        didError: true,
+        error: 'Failed to attach debugger.',
+        diagnosticMessage: simResult.error,
       });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      handlerCtx.emit(headerEvent);
-      handlerCtx.emit(statusLine('error', `Failed to resolve simulator PID: ${message}`));
-      return;
     }
-  }
 
-  if (!pid) {
-    handlerCtx.emit(headerEvent);
-    handlerCtx.emit(statusLine('error', 'Missing PID: Unable to resolve process ID to attach'));
-    return;
-  }
+    const simulatorId = simResult.uuid;
+    if (!simulatorId) {
+      return createDebugAttachResult({
+        didError: true,
+        error: 'Failed to attach debugger.',
+        diagnosticMessage: 'Simulator resolution failed: Unable to determine simulator UUID',
+      });
+    }
 
-  return withErrorHandling(
-    handlerCtx,
-    async () => {
+    let pid = params.pid;
+    if (!pid && params.bundleId) {
+      try {
+        pid = await resolveSimulatorAppPid({
+          executor,
+          simulatorId,
+          bundleId: params.bundleId,
+        });
+      } catch (error) {
+        const diagnosticMessage = toErrorMessage(error);
+        return createDebugAttachResult({
+          didError: true,
+          error: 'Failed to attach debugger.',
+          diagnosticMessage,
+          simulatorId,
+        });
+      }
+    }
+
+    if (!pid) {
+      return createDebugAttachResult({
+        didError: true,
+        error: 'Failed to attach debugger.',
+        diagnosticMessage: 'Missing PID: Unable to resolve process ID to attach',
+        simulatorId,
+      });
+    }
+
+    try {
       const session = await debuggerManager.createSession({
         simulatorId,
         pid,
@@ -127,92 +181,96 @@ export async function debug_attach_simLogic(
         try {
           await debuggerManager.resumeSession(session.id);
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (/not\s*stopped/i.test(message)) {
-            log('debug', 'Process already running after attach, no resume needed');
-          } else {
+          const message = toErrorMessage(error);
+          if (!/not\s*stopped/i.test(message)) {
             try {
               await debuggerManager.detachSession(session.id);
             } catch (detachError) {
-              const detachMessage =
-                detachError instanceof Error ? detachError.message : String(detachError);
               log(
                 'warn',
-                `Failed to detach debugger session after resume failure: ${detachMessage}`,
+                `Failed to detach debugger session after resume failure: ${toErrorMessage(detachError)}`,
               );
             }
-            handlerCtx.emit(headerEvent);
-            handlerCtx.emit(
-              statusLine('error', `Failed to resume debugger after attach: ${message}`),
-            );
-            return;
+            return createDebugAttachResult({
+              didError: true,
+              error: 'Failed to attach debugger.',
+              diagnosticMessage: `Failed to resume debugger after attach: ${message}`,
+              simulatorId,
+              processId: pid,
+            });
           }
         }
       } else {
         try {
           await debuggerManager.runCommand(session.id, 'process interrupt');
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = toErrorMessage(error);
           if (!/already stopped|not running/i.test(message)) {
             try {
               await debuggerManager.detachSession(session.id);
             } catch (detachError) {
-              const detachMessage =
-                detachError instanceof Error ? detachError.message : String(detachError);
               log(
                 'warn',
-                `Failed to detach debugger session after pause failure: ${detachMessage}`,
+                `Failed to detach debugger session after pause failure: ${toErrorMessage(detachError)}`,
               );
             }
-            handlerCtx.emit(headerEvent);
-            handlerCtx.emit(
-              statusLine('error', `Failed to pause debugger after attach: ${message}`),
-            );
-            return;
+            return createDebugAttachResult({
+              didError: true,
+              error: 'Failed to attach debugger.',
+              diagnosticMessage: `Failed to pause debugger after attach: ${message}`,
+              simulatorId,
+              processId: pid,
+            });
           }
         }
       }
 
-      const backendLabel = session.backend === 'dap' ? 'DAP debugger' : 'LLDB';
-      const currentText = isCurrent
-        ? 'This session is now the current debug session.'
-        : 'This session is not set as the current session.';
-
       const execState = await debuggerManager.getExecutionState(session.id);
-      const isRunning = execState.status === 'running' || execState.status === 'unknown';
-      const resumeText = isRunning
-        ? 'Execution is running. App is responsive to UI interaction.'
-        : 'Execution is paused. Use debug_continue to resume before UI automation.';
+      const executionState =
+        execState.status === 'running' || execState.status === 'unknown' ? 'running' : 'paused';
 
-      handlerCtx.emit(headerEvent);
-      if (simResult.warning) {
-        handlerCtx.emit(section('Warning', [simResult.warning]));
-      }
-      handlerCtx.emit(
-        statusLine(
-          'success',
-          `Attached ${backendLabel} to simulator process ${pid} (${simulatorId})`,
-        ),
-      );
-      handlerCtx.emit(
-        detailTree([
-          { label: 'Debug session ID', value: session.id },
-          { label: 'Status', value: currentText },
-          { label: 'Execution', value: resumeText },
-        ]),
-      );
-      handlerCtx.nextStepParams = {
-        debug_breakpoint_add: { debugSessionId: session.id, file: '...', line: 123 },
-        debug_continue: { debugSessionId: session.id },
-        debug_stack: { debugSessionId: session.id },
-      };
+      return createDebugAttachResult({
+        didError: false,
+        debugSessionId: session.id,
+        executionState,
+        simulatorId,
+        processId: pid,
+      });
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createDebugAttachResult({
+        didError: true,
+        error: 'Failed to attach debugger.',
+        diagnosticMessage,
+        simulatorId,
+        processId: pid,
+      });
+    }
+  };
+}
+
+export async function debug_attach_simLogic(
+  params: DebugAttachSimParams,
+  ctx: DebuggerToolContext,
+): Promise<void> {
+  const handlerCtx = getHandlerContext();
+  const executeDebugAttachSim = createDebugAttachSimExecutor(ctx);
+  const result = await executeDebugAttachSim(params);
+
+  setStructuredOutput(handlerCtx, result);
+  if (result.didError) {
+    return;
+  }
+
+  handlerCtx.nextStepParams = {
+    debug_breakpoint_add: {
+      debugSessionId: result.session?.debugSessionId ?? '',
+      file: '...',
+      line: 123,
     },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to attach debugger: ${message}`,
-      logMessage: ({ message }) => `Failed to attach LLDB: ${message}`,
-    },
-  );
+    debug_continue: { debugSessionId: result.session?.debugSessionId ?? '' },
+    debug_stack: { debugSessionId: result.session?.debugSessionId ?? '' },
+  };
 }
 
 const publicSchemaObject = z.strictObject(
@@ -229,7 +287,7 @@ export const schema = getSessionAwareToolSchemaShape({
 
 export const handler = createSessionAwareToolWithContext<DebugAttachSimParams, DebuggerToolContext>(
   {
-    internalSchema: debugAttachSchema as unknown as z.ZodType<DebugAttachSimParams, unknown>,
+    internalSchema: toInternalSchema<DebugAttachSimParams>(debugAttachSchema),
     logicFunction: debug_attach_simLogic,
     getContext: getDefaultDebuggerToolContext,
     requirements: [

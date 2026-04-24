@@ -165,7 +165,7 @@ describe('launch_app_sim tool', () => {
       const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
       expect(text).toContain('Launch App');
       expect(text).toContain('App launched successfully');
-      expect(text).toContain('"iPhone 17" (resolved-uuid)');
+      expect(text).toContain('resolved-uuid');
       expect(result.nextStepParams).toEqual({
         open_sim: {},
         stop_app_sim: { simulatorId: 'resolved-uuid', bundleId: 'io.sentry.testapp' },
@@ -255,7 +255,7 @@ describe('launch_app_sim tool', () => {
       );
 
       const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
-      expect(text).toContain('Launch app in simulator operation failed');
+      expect(text).toContain('Failed to launch app');
       expect(text).toContain('Launch failed');
       expect(result.isError).toBe(true);
     });

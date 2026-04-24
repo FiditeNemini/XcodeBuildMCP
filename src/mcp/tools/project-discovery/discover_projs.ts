@@ -7,11 +7,14 @@
 
 import * as z from 'zod';
 import * as path from 'node:path';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { ProjectListDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import { getDefaultFileSystemExecutor, getDefaultCommandExecutor } from '../../../utils/command.ts';
 import type { FileSystemExecutor } from '../../../utils/FileSystemExecutor.ts';
 import { createTypedTool, getHandlerContext } from '../../../utils/typed-tool-factory.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
 
 const DEFAULT_MAX_DEPTH = 3;
 const SKIPPED_DIRS = new Set(['build', 'DerivedData', 'Pods', '.git', 'node_modules']);
@@ -140,6 +143,20 @@ export interface DiscoverProjectsResult {
 }
 
 type DiscoverProjsParams = z.infer<typeof discoverProjsSchema>;
+type DiscoverProjsResult = ProjectListDomainResult;
+
+interface DiscoverProjectsExecutionContext {
+  workspaceRoot: string;
+  scanPath: string;
+  maxDepth: number;
+}
+
+interface DiscoverProjectsComputation {
+  context: DiscoverProjectsExecutionContext;
+  result?: DiscoverProjectsResult;
+  error?: string;
+  diagnosticMessage?: string;
+}
 
 function isBundleLikePath(workspaceRoot: string): boolean {
   return (
@@ -164,7 +181,7 @@ function resolveScanBase(workspaceRoot: string, scanPath?: string): string {
 async function discoverProjectsOrError(
   params: DiscoverProjectsParams,
   fileSystemExecutor: FileSystemExecutor,
-): Promise<DiscoverProjectsResult | { error: string }> {
+): Promise<DiscoverProjectsComputation> {
   const scanPath = resolveScanBase(params.workspaceRoot, params.scanPath);
   const maxDepth = params.maxDepth ?? DEFAULT_MAX_DEPTH;
   const workspaceRoot = params.workspaceRoot;
@@ -183,6 +200,12 @@ async function discoverProjectsOrError(
     absoluteScanPath = normalizedWorkspaceRoot;
   }
 
+  const context: DiscoverProjectsExecutionContext = {
+    workspaceRoot: path.resolve(workspaceRoot),
+    scanPath: absoluteScanPath,
+    maxDepth,
+  };
+
   log(
     'info',
     `Starting project discovery request: path=${absoluteScanPath}, maxDepth=${maxDepth}, workspace=${workspaceRoot}`,
@@ -193,13 +216,13 @@ async function discoverProjectsOrError(
     if (!stats.isDirectory()) {
       const errorMsg = `Scan path is not a directory: ${absoluteScanPath}`;
       log('error', errorMsg);
-      return { error: errorMsg };
+      return { context, error: errorMsg, diagnosticMessage: errorMsg };
     }
   } catch (error) {
     const { code, message } = getErrorDetails(error, 'Unknown error accessing scan path');
     const errorMsg = `Failed to access scan path: ${absoluteScanPath}. Error: ${message}`;
     log('error', `${errorMsg} - Code: ${code ?? 'N/A'}`);
-    return { error: errorMsg };
+    return { context, error: errorMsg, diagnosticMessage: errorMsg };
   }
 
   const results: DiscoverProjectsResult = { projects: [], workspaces: [] };
@@ -214,18 +237,93 @@ async function discoverProjectsOrError(
 
   results.projects.sort();
   results.workspaces.sort();
-  return results;
+  return { context, result: results };
 }
 
 export async function discoverProjects(
   params: DiscoverProjectsParams,
   fileSystemExecutor: FileSystemExecutor,
 ): Promise<DiscoverProjectsResult> {
-  const result = await discoverProjectsOrError(params, fileSystemExecutor);
-  if ('error' in result) {
-    throw new Error(result.error);
+  const computation = await discoverProjectsOrError(params, fileSystemExecutor);
+  if (typeof computation.error === 'string' || !computation.result) {
+    throw new Error(computation.error ?? 'Failed to discover projects');
   }
-  return result;
+  return computation.result;
+}
+
+function createDiscoverProjectsResult(
+  context: DiscoverProjectsExecutionContext,
+  result: DiscoverProjectsResult,
+): DiscoverProjsResult {
+  return {
+    kind: 'project-list',
+    didError: false,
+    error: null,
+    summary: {
+      status: 'SUCCEEDED',
+      projectCount: result.projects.length,
+      workspaceCount: result.workspaces.length,
+      maxDepth: context.maxDepth,
+    },
+    artifacts: {
+      workspaceRoot: context.workspaceRoot,
+      scanPath: context.scanPath,
+    },
+    projects: result.projects.map((projectPath) => ({ path: projectPath })),
+    workspaces: result.workspaces.map((workspacePath) => ({ path: workspacePath })),
+  };
+}
+
+function createDiscoverProjectsErrorResult(
+  context: DiscoverProjectsExecutionContext,
+  message: string,
+  diagnosticMessage?: string,
+): DiscoverProjsResult {
+  return {
+    kind: 'project-list',
+    didError: true,
+    error: 'Failed to discover projects.',
+    summary: {
+      status: 'FAILED',
+      maxDepth: context.maxDepth,
+    },
+    artifacts: {
+      workspaceRoot: context.workspaceRoot,
+      scanPath: context.scanPath,
+    },
+    projects: [],
+    workspaces: [],
+    diagnostics: createBasicDiagnostics({ errors: [diagnosticMessage ?? message] }),
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: DiscoverProjsResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.project-list',
+    schemaVersion: '1',
+  };
+}
+
+export function createDiscoverProjectsExecutor(
+  fileSystemExecutor: FileSystemExecutor,
+): NonStreamingExecutor<DiscoverProjsParams, DiscoverProjsResult> {
+  return async (params) => {
+    const computation = await discoverProjectsOrError(params, fileSystemExecutor);
+    const context = computation.context;
+
+    if (typeof computation.error === 'string' || !computation.result) {
+      return createDiscoverProjectsErrorResult(
+        context,
+        computation.error ?? 'Failed to discover projects',
+        computation.diagnosticMessage,
+      );
+    }
+
+    const discoveryResult = computation.result;
+
+    return createDiscoverProjectsResult(context, discoveryResult);
+  };
 }
 
 /**
@@ -237,50 +335,18 @@ export async function discover_projsLogic(
   fileSystemExecutor: FileSystemExecutor,
 ): Promise<void> {
   const ctx = getHandlerContext();
-  const scanPath = resolveScanBase(params.workspaceRoot, params.scanPath);
-  const maxDepth = params.maxDepth ?? DEFAULT_MAX_DEPTH;
-  const resolvedWorkspaceRoot = path.resolve(params.workspaceRoot);
-  const resolvedScanPath = path.resolve(params.workspaceRoot, scanPath);
+  const executeDiscoverProjects = createDiscoverProjectsExecutor(fileSystemExecutor);
+  const result = await executeDiscoverProjects(params);
 
-  const headerEvent = header('Discover Projects', [
-    { label: 'Workspace root', value: resolvedWorkspaceRoot },
-    { label: 'Scan path', value: resolvedScanPath },
-    { label: 'Max depth', value: String(maxDepth) },
-  ]);
-  const results = await discoverProjectsOrError(params, fileSystemExecutor);
-  if ('error' in results) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', results.error));
-    return;
-  }
+  setStructuredOutput(ctx, result);
 
-  log(
-    'info',
-    `Discovery finished. Found ${results.projects.length} projects and ${results.workspaces.length} workspaces.`,
-  );
-
-  const projectWord = results.projects.length === 1 ? 'project' : 'projects';
-  const workspaceWord = results.workspaces.length === 1 ? 'workspace' : 'workspaces';
-
-  ctx.emit(headerEvent);
-  ctx.emit(
-    statusLine(
-      'success',
-      `Found ${results.projects.length} ${projectWord} and ${results.workspaces.length} ${workspaceWord}`,
-    ),
-  );
-
-  const cwd = process.cwd();
-  function toRelative(p: string): string {
-    return path.relative(cwd, p) || p;
-  }
-
-  if (results.projects.length > 0) {
-    ctx.emit(section('Projects:', results.projects.map(toRelative)));
-  }
-
-  if (results.workspaces.length > 0) {
-    ctx.emit(section('Workspaces:', results.workspaces.map(toRelative)));
+  if (result.didError) {
+    log('error', `Error discovering projects: ${result.error ?? 'Unknown error'}`);
+  } else {
+    log(
+      'info',
+      `Discovery finished. Found ${result.projects.length} projects and ${result.workspaces.length} workspaces.`,
+    );
   }
 }
 

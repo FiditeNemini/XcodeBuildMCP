@@ -2,9 +2,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import * as z from 'zod';
 import type { ToolHandlerContext } from '../rendering/types.ts';
 import { createRenderSession } from '../rendering/render.ts';
+import { renderCliTextTranscript } from './renderers/cli-text-renderer.ts';
 import type { CommandExecutor } from './execution/index.ts';
-import { statusLine } from './tool-event-builders.ts';
-import type { PipelineEvent } from '../types/pipeline-events.ts';
+import type { AnyFragment, DomainFragment } from '../types/domain-fragments.ts';
+import { infrastructureStatus } from '../types/runtime-status.ts';
 
 import { sessionStore, type SessionDefaults } from './session-store.ts';
 import { isSessionDefaultsOptOutEnabled } from './environment.ts';
@@ -17,7 +18,7 @@ import { mergeSessionDefaultArgs } from './session-default-args.ts';
 export interface ToolTestResult {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
-  _meta?: { events: PipelineEvent[] };
+  _fragments?: AnyFragment[];
 }
 
 /**
@@ -52,8 +53,13 @@ function isToolHandlerContext(value: unknown): value is ToolHandlerContext {
 }
 
 function sessionToTestResult(session: ReturnType<typeof createRenderSession>): ToolTestResult {
-  const text = session.finalize();
-  const events = [...session.getEvents()];
+  const fragments = [...session.getFragments()];
+  const text = renderCliTextTranscript({
+    items: fragments,
+    structuredOutput: session.getStructuredOutput?.(),
+    nextSteps: session.getNextSteps?.(),
+    nextStepsRuntime: session.getNextStepsRuntime?.(),
+  });
 
   const content: Array<{ type: 'text'; text: string }> = [];
   if (text) {
@@ -63,7 +69,7 @@ function sessionToTestResult(session: ReturnType<typeof createRenderSession>): T
   return {
     content,
     isError: session.isError() || undefined,
-    ...(events.length > 0 ? { _meta: { events } } : {}),
+    ...(fragments.length > 0 ? { _fragments: fragments } : {}),
   };
 }
 
@@ -81,12 +87,14 @@ function createValidatedHandler<TParams, TContext>(
     const ctx: ToolHandlerContext = hasProvidedHandlerContext
       ? providedContext
       : {
-          emit: (event) => {
-            session!.emit(event);
+          emit: (fragment) => {
+            session!.emit(fragment);
           },
           attach: (image) => {
             session!.attach(image);
           },
+          liveProgressEnabled: false,
+          streamingFragmentsEnabled: false,
         };
     const context =
       providedContext !== undefined && !hasProvidedHandlerContext ? providedContext : getContext();
@@ -95,12 +103,18 @@ function createValidatedHandler<TParams, TContext>(
       const validatedParams = schema.parse(args);
       await handlerContextStorage.run(ctx, () => logicFunction(validatedParams, context));
       if (!hasProvidedHandlerContext) {
+        if (ctx.structuredOutput) {
+          session!.setStructuredOutput?.(ctx.structuredOutput);
+        }
+        if (ctx.nextSteps && ctx.nextSteps.length > 0) {
+          session!.setNextSteps?.([...ctx.nextSteps], 'cli');
+        }
         return sessionToTestResult(session!);
       }
     } catch (error) {
       if (error instanceof z.ZodError) {
         const details = `Invalid parameters:\n${formatZodIssues(error)}`;
-        ctx.emit(statusLine('error', `Parameter validation failed: ${details}`));
+        ctx.emit(infrastructureStatus('error', `Parameter validation failed: ${details}`));
         if (!hasProvidedHandlerContext) {
           return sessionToTestResult(session!);
         }
@@ -163,6 +177,12 @@ export function getSessionAwareToolSchemaShape(opts: {
   return isSessionDefaultsOptOutEnabled() ? opts.legacy.shape : opts.sessionAware.shape;
 }
 
+export function toInternalSchema<TParams>(
+  schema: z.ZodType<TParams> | z.ZodObject<ToolSchemaShape>,
+): z.ZodType<TParams, unknown> {
+  return schema as unknown as z.ZodType<TParams, unknown>;
+}
+
 export function createSessionAwareTool<TParams>(opts: {
   internalSchema: z.ZodType<TParams, unknown>;
   logicFunction: (params: TParams, executor: CommandExecutor) => Promise<void>;
@@ -213,18 +233,26 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
     const ctx: ToolHandlerContext = hasProvidedHandlerContext
       ? providedContext
       : {
-          emit: (event) => {
-            session!.emit(event);
+          emit: (fragment) => {
+            session!.emit(fragment);
           },
           attach: (image) => {
             session!.attach(image);
           },
+          liveProgressEnabled: false,
+          streamingFragmentsEnabled: false,
         };
     const context =
       providedContext !== undefined && !hasProvidedHandlerContext ? providedContext : getContext();
 
     const finalize = (): ToolTestResult | void => {
       if (!hasProvidedHandlerContext) {
+        if (ctx.structuredOutput) {
+          session!.setStructuredOutput?.(ctx.structuredOutput);
+        }
+        if (ctx.nextSteps && ctx.nextSteps.length > 0) {
+          session!.setNextSteps?.([...ctx.nextSteps], 'cli');
+        }
         return sessionToTestResult(session!);
       }
     };
@@ -241,7 +269,7 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
         const provided = pair.filter((k) => Object.prototype.hasOwnProperty.call(sanitizedArgs, k));
         if (provided.length >= 2) {
           ctx.emit(
-            statusLine(
+            infrastructureStatus(
               'error',
               `Parameter validation failed: Invalid parameters:\nMutually exclusive parameters provided: ${provided.join(', ')}. Provide only one.`,
             ),
@@ -269,7 +297,7 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
               setHint,
               optOutEnabled: isSessionDefaultsOptOutEnabled(),
             });
-            ctx.emit(statusLine('error', `${title}: ${body}`));
+            ctx.emit(infrastructureStatus('error', `${title}: ${body}`));
             return finalize();
           }
         } else if ('oneOf' in req) {
@@ -284,7 +312,7 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
               setHint: `Set with: ${setHints}`,
               optOutEnabled: isSessionDefaultsOptOutEnabled(),
             });
-            ctx.emit(statusLine('error', `${title}: ${body}`));
+            ctx.emit(infrastructureStatus('error', `${title}: ${body}`));
             return finalize();
           }
         }
@@ -296,7 +324,7 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
     } catch (error) {
       if (error instanceof z.ZodError) {
         const details = `Invalid parameters:\n${formatZodIssues(error)}`;
-        ctx.emit(statusLine('error', `Parameter validation failed: ${details}`));
+        ctx.emit(infrastructureStatus('error', `Parameter validation failed: ${details}`));
         return finalize();
       }
       throw error;

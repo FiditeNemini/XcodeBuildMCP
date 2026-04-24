@@ -74,12 +74,50 @@ describe('record_sim_video logic - start behavior', () => {
     const texts = result.text();
 
     expect(texts).toContain('30');
-    expect(texts.toLowerCase()).toContain('outputfile is ignored');
+    expect(texts).toContain('Video recording started');
+    expect(texts).toContain('sess-123');
+    expect(texts.toLowerCase()).not.toContain('outputfile is ignored');
 
     expect(result.nextStepParams).toBeDefined();
     expect(result.nextStepParams?.record_sim_video).toBeDefined();
     expect(result.nextStepParams?.record_sim_video).toHaveProperty('stop', true);
     expect(result.nextStepParams?.record_sim_video).toHaveProperty('outputFile');
+  });
+
+  it('keeps start failure summary short and preserves diagnostics', async () => {
+    const video: any = {
+      startSimulatorVideoCapture: async () => ({
+        started: false,
+        error: 'AXe stderr: permission denied',
+      }),
+      stopSimulatorVideoCapture: async () => ({
+        stopped: false,
+      }),
+    };
+
+    const axe = {
+      areAxeToolsAvailable: () => true,
+      isAxeAtLeastVersion: async () => true,
+    };
+
+    const { result, run } = createMockToolHandlerContext();
+    await run(() =>
+      record_sim_videoLogic(
+        {
+          simulatorId: VALID_SIM_ID,
+          start: true,
+        } as any,
+        DUMMY_EXECUTOR,
+        axe,
+        video,
+        createMockFileSystemExecutor(),
+      ),
+    );
+
+    expect(result.isError()).toBe(true);
+    const text = result.text();
+    expect(text).toContain('Failed to start video recording.');
+    expect(text).toContain('AXe stderr: permission denied');
   });
 });
 
@@ -137,8 +175,46 @@ describe('record_sim_video logic - end-to-end stop with rename', () => {
 
     expect(stopResult.isError()).toBe(false);
     const texts = stopResult.text();
-    expect(texts).toContain('Original file: /tmp/recorded.mp4');
-    expect(texts).toContain(`Saved to: ${outputFile}`);
+    expect(texts).toContain('Video recording stopped');
+    expect(texts).toContain(`Output File: ${outputFile}`);
+  });
+
+  it('keeps missing parsed path summary short and preserves raw AXe output', async () => {
+    const video: any = {
+      startSimulatorVideoCapture: async () => ({
+        started: true,
+        sessionId: 'sess-abc',
+      }),
+      stopSimulatorVideoCapture: async () => ({
+        stopped: true,
+        stdout: 'Saved recording but did not include a file path',
+      }),
+    };
+
+    const axe = {
+      areAxeToolsAvailable: () => true,
+      isAxeAtLeastVersion: async () => true,
+    };
+
+    const { result, run } = createMockToolHandlerContext();
+    await run(() =>
+      record_sim_videoLogic(
+        {
+          simulatorId: VALID_SIM_ID,
+          stop: true,
+          outputFile: '/var/videos/final.mp4',
+        } as any,
+        DUMMY_EXECUTOR,
+        axe,
+        video,
+        createMockFileSystemExecutor(),
+      ),
+    );
+
+    expect(result.isError()).toBe(true);
+    const text = result.text();
+    expect(text).toContain('Recording stopped but could not determine the recorded file path.');
+    expect(text).toContain('Raw output: Saved recording but did not include a file path');
   });
 });
 

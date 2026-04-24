@@ -14,11 +14,13 @@ import { getConfig } from './config-store.ts';
 import { recordInternalErrorMetric, recordToolInvocationMetric } from './sentry.ts';
 import type { ToolHandlerContext } from '../rendering/types.ts';
 import { createRenderSession } from '../rendering/render.ts';
+import { toStructuredEnvelope } from './structured-output-envelope.ts';
+import { getMcpOutputSchemaForRegistration } from '../core/structured-output-schema.ts';
 
 function sessionToToolResponse(session: ReturnType<typeof createRenderSession>): ToolResponse {
   const text = session.finalize();
   const attachments = session.getAttachments();
-  const events = [...session.getEvents()];
+  const structuredOutput = session.getStructuredOutput?.();
 
   const content: ToolResponse['content'] = [];
   if (text) {
@@ -35,7 +37,15 @@ function sessionToToolResponse(session: ReturnType<typeof createRenderSession>):
   return {
     content,
     isError: session.isError() || undefined,
-    ...(events.length > 0 ? { _meta: { events } } : {}),
+    ...(structuredOutput
+      ? {
+          structuredContent: toStructuredEnvelope(
+            structuredOutput.result,
+            structuredOutput.schema,
+            structuredOutput.schemaVersion,
+          ),
+        }
+      : {}),
   };
 }
 
@@ -263,6 +273,10 @@ export async function applyWorkflowSelectionFromManifest(
         }
       }
 
+      const outputSchema = toolManifest.outputSchema
+        ? getMcpOutputSchemaForRegistration(toolManifest.outputSchema)
+        : undefined;
+
       catalogTools.push({
         id: toolManifest.id,
         cliName: getEffectiveCliName(toolManifest),
@@ -270,6 +284,7 @@ export async function applyWorkflowSelectionFromManifest(
         workflow: workflow.id,
         description: toolManifest.description,
         annotations: toolManifest.annotations,
+        outputSchema: toolManifest.outputSchema,
         nextStepTemplates: toolManifest.nextSteps,
         mcpSchema: toolModule.schema,
         cliSchema: toolModule.schema,
@@ -283,6 +298,7 @@ export async function applyWorkflowSelectionFromManifest(
           {
             description: toolManifest.description ?? '',
             inputSchema: toolModule.schema,
+            ...(outputSchema ? { outputSchema } : {}),
             annotations: toolManifest.annotations,
           },
           async (args: unknown): Promise<ToolResponse> => {
@@ -290,10 +306,18 @@ export async function applyWorkflowSelectionFromManifest(
             try {
               const session = createRenderSession('text');
               const ctx: ToolHandlerContext = {
-                emit: session.emit,
+                liveProgressEnabled: false,
+                streamingFragmentsEnabled: false,
+                emit: (fragment) => {
+                  session.emit(fragment);
+                },
                 attach: session.attach,
               };
               await toolModule.handler(args as Record<string, unknown>, ctx);
+
+              if (ctx.structuredOutput) {
+                session.setStructuredOutput?.(ctx.structuredOutput);
+              }
 
               const catalog = registryState.catalog;
               const catalogTool = catalog?.getByMcpName(toolName);

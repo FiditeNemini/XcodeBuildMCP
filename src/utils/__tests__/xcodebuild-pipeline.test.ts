@@ -1,8 +1,9 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { createXcodebuildPipeline } from '../xcodebuild-pipeline.ts';
-import { STAGE_RANK } from '../../types/pipeline-events.ts';
-import type { PipelineEvent } from '../../types/pipeline-events.ts';
-import { renderEvents } from '../../rendering/render.ts';
+import { STAGE_RANK } from '../../types/domain-fragments.ts';
+import type { AnyFragment, DomainFragment } from '../../types/domain-fragments.ts';
+import { renderCliTextTranscript } from '../renderers/cli-text-renderer.ts';
+import type { StructuredToolOutput } from '../../rendering/types.ts';
 
 describe('xcodebuild-pipeline', () => {
   const originalEnv = { ...process.env };
@@ -17,7 +18,7 @@ describe('xcodebuild-pipeline', () => {
   });
 
   it('produces MCP content from xcodebuild test output', () => {
-    const emittedEvents: PipelineEvent[] = [];
+    const emittedEvents: AnyFragment[] = [];
     const pipeline = createXcodebuildPipeline({
       operation: 'TEST',
       toolName: 'test_sim',
@@ -25,11 +26,11 @@ describe('xcodebuild-pipeline', () => {
       emit: (event) => emittedEvents.push(event),
     });
 
-    pipeline.emitEvent({
-      type: 'header',
-      timestamp: '2025-01-01T00:00:00.000Z',
-      operation: 'Test',
-      params: [{ label: 'Scheme', value: 'MyApp' }],
+    pipeline.emitFragment({
+      kind: 'test-result',
+      fragment: 'invocation',
+      operation: 'TEST',
+      request: { scheme: 'MyApp' },
     });
 
     pipeline.onStdout('Resolve Package Graph\n');
@@ -45,22 +46,50 @@ describe('xcodebuild-pipeline', () => {
     expect(result.state.milestones.map((m) => m.stage)).toContain('RESOLVING_PACKAGES');
     expect(result.state.milestones.map((m) => m.stage)).toContain('COMPILING');
 
-    // Rendered text should contain relevant content
-    const text = renderEvents(emittedEvents, 'text');
-    expect(text).toContain('Test');
-    expect(text).toContain('Resolving packages');
+    const structuredOutput: StructuredToolOutput = {
+      schema: 'xcodebuildmcp.output.test-result',
+      schemaVersion: '1.0.0',
+      result: {
+        kind: 'test-result',
+        didError: true,
+        error: 'Tests failed',
+        summary: {
+          status: 'FAILED',
+          durationMs: 2345,
+          target: 'simulator',
+          counts: {
+            passed: 1,
+            failed: 1,
+            skipped: 0,
+          },
+        },
+        artifacts: { buildLogPath: pipeline.logPath },
+        diagnostics: {
+          warnings: [],
+          errors: [],
+          testFailures: [],
+        },
+      },
+    };
 
-    // Events array should contain all events
+    const text = renderCliTextTranscript({
+      items: emittedEvents,
+      structuredOutput,
+    });
+    expect(text).toContain('Test');
+    expect(text).not.toContain('Resolving packages');
+
     expect(emittedEvents.length).toBeGreaterThan(0);
-    const eventTypes = emittedEvents.map((e) => e.type);
-    expect(eventTypes).toContain('header');
-    expect(eventTypes).toContain('build-stage');
-    expect(eventTypes).toContain('test-progress');
-    expect(eventTypes).toContain('summary');
+    const fragmentTypes = emittedEvents.map((e) => e.fragment);
+    expect(fragmentTypes).toContain('invocation');
+    expect(fragmentTypes).toContain('build-stage');
+    expect(fragmentTypes).toContain('test-progress');
+    expect(fragmentTypes).toContain('build-summary');
+    expect(text.match(/1 test failed, 1 passed, 0 skipped/g)).toHaveLength(1);
   });
 
   it('handles build output with warnings and errors', () => {
-    const emittedEvents: PipelineEvent[] = [];
+    const emittedEvents: AnyFragment[] = [];
     const pipeline = createXcodebuildPipeline({
       operation: 'BUILD',
       toolName: 'build_sim',
@@ -77,11 +106,20 @@ describe('xcodebuild-pipeline', () => {
     expect(result.state.warnings).toHaveLength(1);
     expect(result.state.errors).toHaveLength(1);
     expect(result.state.finalStatus).toBe('FAILED');
+    expect(
+      emittedEvents.some(
+        (event) =>
+          event.fragment === 'build-summary' &&
+          event.operation === 'BUILD' &&
+          event.status === 'FAILED' &&
+          event.durationMs === 500,
+      ),
+    ).toBe(true);
   });
 
   it('supports multi-phase with minimumStage', () => {
     // Phase 1: build-for-testing
-    const phase1Events: PipelineEvent[] = [];
+    const phase1Events: AnyFragment[] = [];
     const phase1 = createXcodebuildPipeline({
       operation: 'TEST',
       toolName: 'test_sim',
@@ -103,7 +141,7 @@ describe('xcodebuild-pipeline', () => {
       | 'COMPILING'
       | undefined;
 
-    const phase2Events: PipelineEvent[] = [];
+    const phase2Events: AnyFragment[] = [];
     const phase2 = createXcodebuildPipeline({
       operation: 'TEST',
       toolName: 'test_sim',
@@ -128,8 +166,8 @@ describe('xcodebuild-pipeline', () => {
     expect(result.state.completedTests).toBe(1);
   });
 
-  it('emitEvent passes tool-originated events through the pipeline', () => {
-    const emittedEvents: PipelineEvent[] = [];
+  it('emitFragment passes tool-originated events through the pipeline', () => {
+    const emittedEvents: AnyFragment[] = [];
     const pipeline = createXcodebuildPipeline({
       operation: 'TEST',
       toolName: 'test_sim',
@@ -137,9 +175,9 @@ describe('xcodebuild-pipeline', () => {
       emit: (event) => emittedEvents.push(event),
     });
 
-    pipeline.emitEvent({
-      type: 'test-discovery',
-      timestamp: '2025-01-01T00:00:00.000Z',
+    pipeline.emitFragment({
+      kind: 'test-result',
+      fragment: 'test-discovery',
       operation: 'TEST',
       total: 3,
       tests: ['testA', 'testB', 'testC'],
@@ -148,35 +186,46 @@ describe('xcodebuild-pipeline', () => {
 
     pipeline.finalize(true, 100);
 
-    const discoveryEvents = emittedEvents.filter((e) => e.type === 'test-discovery');
+    const discoveryEvents = emittedEvents.filter((e) => e.fragment === 'test-discovery');
     expect(discoveryEvents).toHaveLength(1);
 
-    const text = renderEvents(emittedEvents, 'text');
-    expect(text).toContain(
-      'Discovered 3 test(s):\n   testA\n   testB\n   testC\n\n✅ Test succeeded.',
-    );
+    const text = renderCliTextTranscript({
+      items: emittedEvents,
+      structuredOutput: {
+        schema: 'xcodebuildmcp.output.test-result',
+        schemaVersion: '1.0.0',
+        result: {
+          kind: 'test-result',
+          didError: false,
+          error: null,
+          summary: {
+            status: 'SUCCEEDED',
+            durationMs: 100,
+            target: 'simulator',
+            counts: { passed: 3, failed: 0, skipped: 0 },
+          },
+          artifacts: { buildLogPath: pipeline.logPath },
+          diagnostics: {
+            warnings: [],
+            errors: [],
+            testFailures: [],
+          },
+        },
+      },
+    });
+    expect(text).toContain('Discovered 3 test(s):');
+    expect(text).toContain('✅ Test succeeded.');
   });
 
   it('renders test discovery in cli-text mode', () => {
-    const emittedEvents: PipelineEvent[] = [
+    const emittedEvents: AnyFragment[] = [
       {
-        type: 'test-discovery',
-        timestamp: '2025-01-01T00:00:00.000Z',
+        kind: 'test-result',
+        fragment: 'test-discovery',
         operation: 'TEST',
         total: 8,
         tests: ['testA', 'testB', 'testC', 'testD', 'testE', 'testF', 'testG', 'testH'],
         truncated: false,
-      },
-      {
-        type: 'summary',
-        timestamp: '2025-01-01T00:00:01.000Z',
-        operation: 'TEST',
-        status: 'SUCCEEDED',
-        totalTests: 8,
-        passedTests: 8,
-        failedTests: 0,
-        skippedTests: 0,
-        durationMs: 100,
       },
     ];
 
@@ -189,7 +238,32 @@ describe('xcodebuild-pipeline', () => {
     }) as typeof process.stdout.write);
 
     try {
-      renderEvents(emittedEvents, 'cli-text');
+      process.stdout.write(
+        renderCliTextTranscript({
+          items: emittedEvents,
+          structuredOutput: {
+            schema: 'xcodebuildmcp.output.test-result',
+            schemaVersion: '1.0.0',
+            result: {
+              kind: 'test-result',
+              didError: false,
+              error: null,
+              summary: {
+                status: 'SUCCEEDED',
+                durationMs: 100,
+                target: 'simulator',
+                counts: { passed: 8, failed: 0, skipped: 0 },
+              },
+              artifacts: { buildLogPath: '/tmp/Test.xcresult' },
+              diagnostics: {
+                warnings: [],
+                errors: [],
+                testFailures: [],
+              },
+            },
+          },
+        }),
+      );
     } finally {
       writeSpy.mockRestore();
     }
@@ -206,7 +280,7 @@ describe('xcodebuild-pipeline', () => {
     process.env.XCODEBUILDMCP_RUNTIME = 'cli';
     process.env.XCODEBUILDMCP_CLI_OUTPUT_FORMAT = 'json';
 
-    const emittedEvents: PipelineEvent[] = [];
+    const emittedEvents: AnyFragment[] = [];
     const pipeline = createXcodebuildPipeline({
       operation: 'BUILD',
       toolName: 'build_sim',
@@ -219,11 +293,10 @@ describe('xcodebuild-pipeline', () => {
 
     expect(emittedEvents.length).toBeGreaterThan(0);
 
-    // Each emitted event should be valid JSON-serializable with required fields
+    // Each emitted fragment should be valid JSON-serializable with required fields
     for (const event of emittedEvents) {
       const parsed = JSON.parse(JSON.stringify(event));
-      expect(parsed).toHaveProperty('type');
-      expect(parsed).toHaveProperty('timestamp');
+      expect(parsed).toHaveProperty('fragment');
     }
   });
 });

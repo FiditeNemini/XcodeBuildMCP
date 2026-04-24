@@ -1,42 +1,39 @@
+import type { XcodebuildOperation, XcodebuildStage } from '../types/domain-fragments.ts';
 import type {
-  XcodebuildOperation,
-  XcodebuildStage,
-  PipelineEvent,
-} from '../types/pipeline-events.ts';
+  BuildLikeKind,
+  BuildInvocationFragment,
+  BuildInvocationRequest,
+  DomainFragment,
+  AnyFragment,
+} from '../types/domain-fragments.ts';
 import { createXcodebuildEventParser } from './xcodebuild-event-parser.ts';
 import { createXcodebuildRunState } from './xcodebuild-run-state.ts';
-import type { XcodebuildRunState } from './xcodebuild-run-state.ts';
+import type { XcodebuildRunState, XcodebuildRunStateHandle } from './xcodebuild-run-state.ts';
 import { displayPath } from './build-preflight.ts';
 import { resolveEffectiveDerivedDataPath } from './derived-data-path.ts';
 import { formatDeviceId } from './device-name-resolver.ts';
 import { createLogCapture, createParserDebugCapture } from './xcodebuild-log-capture.ts';
 import { log as appLog } from './logging/index.ts';
-import { getHandlerContext, handlerContextStorage } from './typed-tool-factory.ts';
 
 export interface PipelineOptions {
   operation: XcodebuildOperation;
+  kind?: BuildLikeKind;
   toolName: string;
   params: Record<string, unknown>;
   minimumStage?: XcodebuildStage;
-  emit?: (event: PipelineEvent) => void;
+  emit?: (fragment: AnyFragment) => void;
 }
 
 export interface PipelineResult {
   state: XcodebuildRunState;
-  events: PipelineEvent[];
 }
 
-export interface PipelineFinalizeOptions {
-  emitSummary?: boolean;
-  tailEvents?: PipelineEvent[];
-  includeBuildLogFileRef?: boolean;
-  includeParserDebugFileRef?: boolean;
-}
+export interface PipelineFinalizeOptions {}
 
 export interface XcodebuildPipeline {
   onStdout(chunk: string): void;
   onStderr(chunk: string): void;
-  emitEvent(event: PipelineEvent): void;
+  emitFragment(fragment: AnyFragment): void;
   finalize(
     succeeded: boolean,
     durationMs?: number,
@@ -52,48 +49,19 @@ export interface StartedPipeline {
   startedAt: number;
 }
 
-function buildLogDetailTreeEvent(logPath: string): PipelineEvent {
-  return {
-    type: 'detail-tree',
-    timestamp: new Date().toISOString(),
-    items: [{ label: 'Build Logs', value: logPath }],
-  };
-}
+type RunStateEvent = Parameters<XcodebuildRunStateHandle['push']>[0];
 
-function injectBuildLogIntoTailEvents(
-  tailEvents: PipelineEvent[],
-  logPath: string,
-): PipelineEvent[] {
-  const hasBuildLogTree = tailEvents.some(
-    (event) =>
-      event.type === 'detail-tree' && event.items.some((item) => item.label === 'Build Logs'),
-  );
-  if (hasBuildLogTree) {
-    return tailEvents;
+function isRunStateFragment(fragment: DomainFragment): fragment is RunStateEvent {
+  switch (fragment.fragment) {
+    case 'build-stage':
+    case 'compiler-diagnostic':
+    case 'test-discovery':
+    case 'test-progress':
+    case 'test-failure':
+      return true;
+    default:
+      return false;
   }
-
-  const existingDetailTree = tailEvents.find((event) => event.type === 'detail-tree');
-  if (existingDetailTree) {
-    return tailEvents.map((event) =>
-      event === existingDetailTree
-        ? {
-            ...existingDetailTree,
-            items: [...existingDetailTree.items, { label: 'Build Logs', value: logPath }],
-          }
-        : event,
-    );
-  }
-
-  const nextStepsIndex = tailEvents.findIndex((event) => event.type === 'next-steps');
-  if (nextStepsIndex === -1) {
-    return [...tailEvents, buildLogDetailTreeEvent(logPath)];
-  }
-
-  return [
-    ...tailEvents.slice(0, nextStepsIndex),
-    buildLogDetailTreeEvent(logPath),
-    ...tailEvents.slice(nextStepsIndex),
-  ];
 }
 
 function buildHeaderParams(
@@ -104,6 +72,9 @@ function buildHeaderParams(
     scheme: 'Scheme',
     workspacePath: 'Workspace',
     projectPath: 'Project',
+    packagePath: 'Package',
+    targetName: 'Target',
+    executableName: 'Executable',
     configuration: 'Configuration',
     platform: 'Platform',
     simulatorName: 'Simulator',
@@ -156,8 +127,10 @@ function buildHeaderParams(
     }
   }
 
-  // Always show Derived Data even if not explicitly provided
-  if (!result.some((r) => r.label === 'Derived Data')) {
+  const hasXcodebuildContext = result.some(
+    (r) => r.label === 'Scheme' || r.label === 'Workspace' || r.label === 'Project',
+  );
+  if (hasXcodebuildContext && !result.some((r) => r.label === 'Derived Data')) {
     result.push({ label: 'Derived Data', value: displayPath(resolveEffectiveDerivedDataPath()) });
   }
 
@@ -165,43 +138,95 @@ function buildHeaderParams(
 }
 
 /**
- * Creates a pipeline, emits the initial header event, and captures the start
- * timestamp. This consolidates the repeated create-then-emit-start pattern used
- * across all build and test tool implementations.
+ * Derive a display title for a build-like invocation from kind and request data.
  */
-export function startBuildPipeline(
-  options: PipelineOptions & { message: string },
-): StartedPipeline {
-  const emit =
-    options.emit ??
-    (() => {
-      try {
-        return getHandlerContext().emit;
-      } catch {
-        return handlerContextStorage.getStore()?.emit;
-      }
-    })();
-  const pipeline = createXcodebuildPipeline({ ...options, emit });
+export function deriveBuildLikeTitle(
+  kind: BuildLikeKind,
+  request?: BuildInvocationRequest,
+): string {
+  const isSwiftPackage = request?.target === 'swift-package';
+  switch (kind) {
+    case 'build-result':
+      return isSwiftPackage ? 'Swift Package Build' : 'Build';
+    case 'build-run-result':
+      return isSwiftPackage ? 'Swift Package Run' : 'Build & Run';
+    case 'test-result':
+      return isSwiftPackage ? 'Swift Package Test' : 'Test';
+  }
+}
 
-  pipeline.emitEvent({
-    type: 'header',
-    timestamp: new Date().toISOString(),
-    operation: options.message
-      .replace(/^[^\p{L}]+/u, '')
-      .split('\n')[0]
-      .trim(),
-    params: buildHeaderParams(options.params),
-  });
+/**
+ * Convert a BuildInvocationRequest to display-ready header params.
+ */
+export function invocationRequestToHeaderParams(
+  request: BuildInvocationRequest,
+): Array<{ label: string; value: string }> {
+  return buildHeaderParams(request as Record<string, unknown>);
+}
 
-  return { pipeline, startedAt: Date.now() };
+/**
+ * Create a BuildInvocationRequest from raw tool params.
+ */
+export function createBuildInvocationRequest(
+  params: Record<string, unknown>,
+): BuildInvocationRequest {
+  const request: BuildInvocationRequest = {};
+  const stringKeys: Array<keyof BuildInvocationRequest> = [
+    'scheme',
+    'workspacePath',
+    'projectPath',
+    'packagePath',
+    'targetName',
+    'executableName',
+    'configuration',
+    'platform',
+    'simulatorName',
+    'simulatorId',
+    'deviceId',
+    'arch',
+    'derivedDataPath',
+  ];
+  for (const key of stringKeys) {
+    const value = params[key];
+    if (typeof value === 'string' && value.length > 0) {
+      (request as Record<string, unknown>)[key] = value;
+    }
+  }
+  const arrayKeys: Array<keyof BuildInvocationRequest> = ['onlyTesting', 'skipTesting'];
+  for (const key of arrayKeys) {
+    const value = params[key];
+    if (Array.isArray(value) && value.length > 0) {
+      (request as Record<string, unknown>)[key] = value;
+    }
+  }
+  if (typeof params.target === 'string') {
+    request.target = params.target as BuildInvocationRequest['target'];
+  }
+  return request;
+}
+
+/**
+ * Create a BuildInvocationFragment for streaming.
+ */
+export function createBuildInvocationFragment(
+  kind: BuildLikeKind,
+  operation: 'BUILD' | 'TEST',
+  request: BuildInvocationRequest,
+): BuildInvocationFragment {
+  return {
+    kind,
+    fragment: 'invocation',
+    operation,
+    request,
+  };
 }
 
 export function createXcodebuildPipeline(options: PipelineOptions): XcodebuildPipeline {
   if (!options.emit) {
-    throw new Error(
-      'Pipeline requires an emit callback. Use startBuildPipeline() or pass emit explicitly.',
-    );
+    throw new Error('Pipeline requires an emit callback. Pass emit explicitly.');
   }
+  const kind: BuildLikeKind =
+    options.kind ?? (options.operation === 'TEST' ? 'test-result' : 'build-result');
   const logCapture = createLogCapture(options.toolName);
   const debugCapture = createParserDebugCapture(options.toolName);
   const emit = options.emit;
@@ -214,8 +239,13 @@ export function createXcodebuildPipeline(options: PipelineOptions): XcodebuildPi
 
   const parser = createXcodebuildEventParser({
     operation: options.operation,
-    onEvent: (event: PipelineEvent) => {
-      runState.push(event);
+    kind,
+    onEvent: (fragment) => {
+      if (isRunStateFragment(fragment)) {
+        runState.push(fragment);
+      } else {
+        emit(fragment);
+      }
     },
     onUnrecognizedLine: (line: string) => {
       debugCapture.addUnrecognizedLine(line);
@@ -233,22 +263,22 @@ export function createXcodebuildPipeline(options: PipelineOptions): XcodebuildPi
       parser.onStderr(chunk);
     },
 
-    emitEvent(event: PipelineEvent): void {
-      runState.push(event);
+    emitFragment(fragment: DomainFragment): void {
+      if (isRunStateFragment(fragment)) {
+        runState.push(fragment);
+        return;
+      }
+
+      emit(fragment);
     },
 
     finalize(
       succeeded: boolean,
       durationMs?: number,
-      finalizeOptions?: PipelineFinalizeOptions,
+      _finalizeOptions?: PipelineFinalizeOptions,
     ): PipelineResult {
       parser.flush();
       logCapture.close();
-
-      const tailEvents =
-        finalizeOptions?.includeBuildLogFileRef === false
-          ? [...(finalizeOptions?.tailEvents ?? [])]
-          : injectBuildLogIntoTailEvents(finalizeOptions?.tailEvents ?? [], logCapture.path);
 
       const debugPath = debugCapture.flush();
       if (debugPath) {
@@ -256,30 +286,12 @@ export function createXcodebuildPipeline(options: PipelineOptions): XcodebuildPi
           'info',
           `[Pipeline] ${debugCapture.count} unrecognized parser lines written to ${debugPath}`,
         );
-        if (finalizeOptions?.includeParserDebugFileRef !== false) {
-          runState.push({
-            type: 'status-line',
-            timestamp: new Date().toISOString(),
-            level: 'warning',
-            message: 'Parsing issue detected - debug log:',
-          });
-          runState.push({
-            type: 'file-ref',
-            timestamp: new Date().toISOString(),
-            label: 'Parser Debug Log',
-            path: debugPath,
-          });
-        }
       }
 
-      const finalState = runState.finalize(succeeded, durationMs, {
-        emitSummary: finalizeOptions?.emitSummary,
-        tailEvents,
-      });
+      const finalState = runState.finalize(succeeded, durationMs);
 
       return {
         state: finalState,
-        events: finalState.events,
       };
     },
 

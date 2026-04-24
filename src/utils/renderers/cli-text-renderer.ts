@@ -1,14 +1,26 @@
+import type { NextStep } from '../../types/common.ts';
+import type { StructuredToolOutput } from '../../rendering/types.ts';
+import type { AnyFragment, BuildRunPhase } from '../../types/domain-fragments.ts';
+import type { XcodebuildOperation } from '../../types/domain-fragments.ts';
 import type {
-  CompilerErrorEvent,
-  CompilerWarningEvent,
-  PipelineEvent,
-  StatusLineEvent,
-  TestFailureEvent,
-} from '../../types/pipeline-events.ts';
+  CompilerErrorRenderItem,
+  CompilerWarningRenderItem,
+  RenderItem,
+  StatusRenderItem,
+  TestFailureRenderItem,
+} from '../../rendering/render-items.ts';
+import { deriveBuildLikeTitle, invocationRequestToHeaderParams } from '../xcodebuild-pipeline.ts';
 import { createCliProgressReporter } from '../cli-progress-reporter.ts';
 import { formatCliTextLine } from '../terminal-output.ts';
+import {
+  createNextStepsBlock,
+  createStreamingTailItems,
+  renderDomainResultTextItems,
+  type SummaryTextBlock,
+  type TextRenderableItem,
+} from './domain-result-text.ts';
 import { deriveDiagnosticBaseDir } from './index.ts';
-import type { PipelineRenderer } from './index.ts';
+import type { TranscriptRenderer } from './index.ts';
 import {
   formatHeaderEvent,
   formatBuildStageEvent,
@@ -26,6 +38,14 @@ import {
   formatNextStepsEvent,
   formatTestDiscoveryEvent,
 } from './event-formatting.ts';
+import {
+  createXcodebuildEventParser,
+  type XcodebuildEventParser,
+} from '../xcodebuild-event-parser.ts';
+import {
+  createXcodebuildRunState,
+  type XcodebuildRunStateHandle,
+} from '../xcodebuild-run-state.ts';
 
 function formatCliTextBlock(text: string): string {
   return text
@@ -52,16 +72,39 @@ interface CliTextRendererOptions {
   suppressWarnings?: boolean;
 }
 
-function createCliTextProcessor(options: CliTextProcessorOptions): PipelineRenderer {
+export interface CliTextTranscriptInput {
+  items?: readonly AnyFragment[];
+  structuredOutput?: StructuredToolOutput;
+  nextSteps?: readonly NextStep[];
+  nextStepsRuntime?: 'cli' | 'daemon' | 'mcp';
+  suppressWarnings?: boolean;
+}
+
+interface XcodebuildParserState {
+  parser: XcodebuildEventParser;
+  runState: XcodebuildRunStateHandle;
+  bufferedFragments: AnyFragment[];
+}
+
+type RunStateEvent = Parameters<XcodebuildRunStateHandle['push']>[0];
+
+function createCliTextProcessor(options: CliTextProcessorOptions): TranscriptRenderer {
   const { interactive, sink, suppressWarnings } = options;
-  const groupedCompilerErrors: CompilerErrorEvent[] = [];
-  const groupedWarnings: CompilerWarningEvent[] = [];
-  const groupedTestFailures: TestFailureEvent[] = [];
+  const groupedCompilerErrors: CompilerErrorRenderItem[] = [];
+  const groupedWarnings: CompilerWarningRenderItem[] = [];
+  const groupedTestFailures: TestFailureRenderItem[] = [];
+  const parserStates = new Map<XcodebuildOperation, XcodebuildParserState>();
   let pendingTransientRuntimeLine: string | null = null;
   let diagnosticBaseDir: string | null = null;
   let hasDurableRuntimeContent = false;
-  let lastVisibleEventType: PipelineEvent['type'] | null = null;
-  let lastStatusLineLevel: StatusLineEvent['level'] | null = null;
+  let lastVisibleEventType: TextRenderableItem['type'] | null = null;
+  let lastStatusLineLevel: StatusRenderItem['level'] | null = null;
+  let structuredOutput: StructuredToolOutput | undefined;
+  let sawIncomingHeaderEvent = false;
+  let sawIncomingNonHeaderEvent = false;
+  let nextSteps: readonly NextStep[] = [];
+  let nextStepsRuntime: 'cli' | 'daemon' | 'mcp' | undefined;
+  let sawProgressNextSteps = false;
 
   function writeDurable(text: string): void {
     sink.clearTransient();
@@ -73,6 +116,7 @@ function createCliTextProcessor(options: CliTextProcessorOptions): PipelineRende
   function writeSection(text: string): void {
     sink.clearTransient();
     pendingTransientRuntimeLine = null;
+    hasDurableRuntimeContent = true;
     sink.writeSection(text);
   }
 
@@ -82,174 +126,299 @@ function createCliTextProcessor(options: CliTextProcessorOptions): PipelineRende
     }
   }
 
-  return {
-    onEvent(event: PipelineEvent): void {
-      switch (event.type) {
-        case 'header': {
-          diagnosticBaseDir = deriveDiagnosticBaseDir(event);
-          hasDurableRuntimeContent = false;
-          writeSection(formatHeaderEvent(event));
-          lastVisibleEventType = 'header';
-          break;
-        }
+  function flushGroupedDiagnostics(includeCompilerErrors: boolean): boolean {
+    const diagOpts = { baseDir: diagnosticBaseDir ?? undefined };
+    const diagnosticSections: string[] = [];
 
-        case 'build-stage': {
-          if (interactive) {
-            pendingTransientRuntimeLine = formatBuildStageEvent(event);
-            sink.updateTransient(formatTransientBuildStageEvent(event));
-          } else {
-            writeDurable(formatBuildStageEvent(event));
-          }
-          lastVisibleEventType = 'build-stage';
-          break;
-        }
+    if (includeCompilerErrors && groupedCompilerErrors.length > 0) {
+      diagnosticSections.push(formatGroupedCompilerErrors(groupedCompilerErrors, diagOpts));
+      groupedCompilerErrors.length = 0;
+    }
+    if (groupedTestFailures.length > 0) {
+      diagnosticSections.push(formatGroupedTestFailures(groupedTestFailures, diagOpts));
+      groupedTestFailures.length = 0;
+    }
+    if (groupedWarnings.length > 0) {
+      diagnosticSections.push(formatGroupedWarnings(groupedWarnings, diagOpts));
+      groupedWarnings.length = 0;
+    }
 
-        case 'status-line': {
-          const transient = interactive ? formatTransientStatusLineEvent(event) : null;
-          if (transient) {
-            pendingTransientRuntimeLine = formatStatusLineEvent(event);
-            sink.updateTransient(transient);
-            break;
-          }
+    if (diagnosticSections.length === 0) {
+      return false;
+    }
 
-          const compact =
-            (lastVisibleEventType === 'status-line' &&
-              lastStatusLineLevel !== 'warning' &&
-              event.level !== 'warning') ||
-            lastVisibleEventType === 'summary';
-          if (compact) {
-            writeDurable(formatStatusLineEvent(event));
-          } else {
-            writeSection(formatStatusLineEvent(event));
-          }
-          lastVisibleEventType = 'status-line';
-          lastStatusLineLevel = event.level;
-          break;
-        }
+    const diagnosticsBlock = diagnosticSections.join('\n\n');
+    if (pendingTransientRuntimeLine) {
+      writeSection(`${pendingTransientRuntimeLine}\n\n${diagnosticsBlock}`);
+      pendingTransientRuntimeLine = null;
+    } else if (hasDurableRuntimeContent) {
+      writeSection(diagnosticsBlock);
+    } else {
+      writeDurable(diagnosticsBlock);
+    }
 
-        case 'section': {
-          writeSection(formatSectionEvent(event));
-          lastVisibleEventType = 'section';
-          lastStatusLineLevel = null;
-          break;
-        }
+    return true;
+  }
 
-        case 'detail-tree': {
-          writeDurable(formatDetailTreeEvent(event));
-          lastVisibleEventType = 'detail-tree';
-          lastStatusLineLevel = null;
-          break;
-        }
-
-        case 'table': {
-          writeSection(formatTableEvent(event));
-          lastVisibleEventType = 'table';
-          lastStatusLineLevel = null;
-          break;
-        }
-
-        case 'file-ref': {
-          writeSection(formatFileRefEvent(event));
-          lastVisibleEventType = 'file-ref';
-          lastStatusLineLevel = null;
-          break;
-        }
-
-        case 'compiler-warning': {
-          if (!suppressWarnings) {
-            groupedWarnings.push(event);
-          }
-          break;
-        }
-
-        case 'compiler-error': {
-          groupedCompilerErrors.push(event);
-          break;
-        }
-
-        case 'test-discovery': {
-          writeDurable(formatTestDiscoveryEvent(event));
-          lastVisibleEventType = 'test-discovery';
-          lastStatusLineLevel = null;
-          break;
-        }
-
-        case 'test-progress': {
-          if (interactive) {
-            const failWord = event.failed === 1 ? 'failure' : 'failures';
-            pendingTransientRuntimeLine = null;
-            sink.updateTransient(`Running tests (${event.completed}, ${event.failed} ${failWord})`);
-          }
-          break;
-        }
-
-        case 'test-failure': {
-          groupedTestFailures.push(event);
-          break;
-        }
-
-        case 'summary': {
-          const diagOpts = { baseDir: diagnosticBaseDir ?? undefined };
-          const diagnosticSections: string[] = [];
-
-          if (groupedTestFailures.length > 0) {
-            diagnosticSections.push(formatGroupedTestFailures(groupedTestFailures, diagOpts));
-            groupedTestFailures.length = 0;
-          }
-
-          if (groupedWarnings.length > 0) {
-            diagnosticSections.push(formatGroupedWarnings(groupedWarnings, diagOpts));
-            groupedWarnings.length = 0;
-          }
-
-          if (event.status === 'FAILED' && groupedCompilerErrors.length > 0) {
-            diagnosticSections.push(formatGroupedCompilerErrors(groupedCompilerErrors, diagOpts));
-            groupedCompilerErrors.length = 0;
-          }
-
-          if (diagnosticSections.length > 0) {
-            const diagnosticsBlock = diagnosticSections.join('\n\n');
-            if (pendingTransientRuntimeLine) {
-              writeSection(`${pendingTransientRuntimeLine}\n\n${diagnosticsBlock}`);
-              pendingTransientRuntimeLine = null;
-            } else if (hasDurableRuntimeContent) {
-              writeSection(diagnosticsBlock);
-            } else {
-              writeDurable(diagnosticsBlock);
-            }
-          } else if (event.status === 'FAILED') {
-            flushPendingTransientRuntimeLine();
-          }
-
-          writeSection(formatSummaryEvent(event));
-          lastVisibleEventType = 'summary';
-          lastStatusLineLevel = null;
-          break;
-        }
-
-        case 'next-steps': {
-          const nextStepRuntime =
-            event.runtime === 'mcp' || event.runtime === 'daemon' ? 'mcp' : 'cli';
-          writeSection(formatNextStepsEvent(event, nextStepRuntime));
-          lastVisibleEventType = 'next-steps';
-          lastStatusLineLevel = null;
-          break;
-        }
+  function processItem(item: TextRenderableItem): void {
+    switch (item.type) {
+      case 'header': {
+        diagnosticBaseDir = deriveDiagnosticBaseDir(item);
+        hasDurableRuntimeContent = false;
+        writeSection(formatHeaderEvent(item));
+        lastVisibleEventType = 'header';
+        lastStatusLineLevel = null;
+        break;
       }
+
+      case 'build-stage': {
+        // Build stages are progress indicators, rendered transiently in
+        // interactive terminals and dropped from non-interactive output
+        // (final snapshots shouldn't preserve transient progress).
+        if (interactive) {
+          pendingTransientRuntimeLine = formatBuildStageEvent(item);
+          sink.updateTransient(formatTransientBuildStageEvent(item));
+        }
+        break;
+      }
+
+      case 'status': {
+        const transient = interactive ? formatTransientStatusLineEvent(item) : null;
+        if (transient) {
+          pendingTransientRuntimeLine = formatStatusLineEvent(item);
+          sink.updateTransient(transient);
+          break;
+        }
+
+        const compact =
+          (lastVisibleEventType === 'status' &&
+            lastStatusLineLevel !== 'warning' &&
+            item.level !== 'warning') ||
+          lastVisibleEventType === 'summary';
+        if (compact) {
+          writeDurable(formatStatusLineEvent(item));
+        } else {
+          writeSection(formatStatusLineEvent(item));
+        }
+        lastVisibleEventType = 'status';
+        lastStatusLineLevel = item.level;
+        break;
+      }
+
+      case 'section': {
+        writeSection(formatSectionEvent(item));
+        lastVisibleEventType = 'section';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'detail-tree': {
+        writeDurable(formatDetailTreeEvent(item));
+        lastVisibleEventType = 'detail-tree';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'table': {
+        writeSection(formatTableEvent(item));
+        lastVisibleEventType = 'table';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'artifact':
+      case 'file-ref': {
+        writeSection(formatFileRefEvent(item));
+        lastVisibleEventType = item.type;
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'compiler-warning': {
+        if (!suppressWarnings) {
+          groupedWarnings.push(item);
+        }
+        break;
+      }
+
+      case 'compiler-error': {
+        groupedCompilerErrors.push(item);
+        break;
+      }
+
+      case 'test-discovery': {
+        writeSection(formatTestDiscoveryEvent(item));
+        lastVisibleEventType = 'test-discovery';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'test-progress': {
+        if (interactive) {
+          const failWord = item.failed === 1 ? 'failure' : 'failures';
+          pendingTransientRuntimeLine = null;
+          sink.updateTransient(`Running tests (${item.completed}, ${item.failed} ${failWord})`);
+        }
+        break;
+      }
+
+      case 'test-failure': {
+        groupedTestFailures.push(item);
+        break;
+      }
+
+      case 'summary': {
+        const renderedDiagnostics = flushGroupedDiagnostics(item.status === 'FAILED');
+
+        if (!renderedDiagnostics && item.status === 'FAILED') {
+          flushPendingTransientRuntimeLine();
+        }
+
+        writeSection(formatSummaryEvent(item));
+        lastVisibleEventType = 'summary';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'next-steps': {
+        sawProgressNextSteps = true;
+        const runtime = item.runtime === 'mcp' || item.runtime === 'daemon' ? 'mcp' : 'cli';
+        writeSection(formatNextStepsEvent(item, runtime));
+        lastVisibleEventType = 'next-steps';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'text-block': {
+        writeDurable(item.text);
+        lastVisibleEventType = 'text-block';
+        lastStatusLineLevel = null;
+        break;
+      }
+
+      case 'xcodebuild-line': {
+        const state = ensureParserState(item.operation);
+        const chunk = `${item.line}\n`;
+        if (item.stream === 'stderr') {
+          state.parser.onStderr(chunk);
+        } else {
+          state.parser.onStdout(chunk);
+        }
+        drainParserState(state);
+        break;
+      }
+    }
+  }
+
+  function ensureParserState(operation: XcodebuildOperation): XcodebuildParserState {
+    const existing = parserStates.get(operation);
+    if (existing) {
+      return existing;
+    }
+
+    const bufferedFragments: AnyFragment[] = [];
+    const runState = createXcodebuildRunState({
+      operation,
+      onEvent: (fragment) => {
+        bufferedFragments.push(fragment);
+      },
+    });
+    const parser = createXcodebuildEventParser({
+      operation,
+      onEvent: (event) => {
+        runState.push(event as RunStateEvent);
+      },
+    });
+
+    const state = { parser, runState, bufferedFragments };
+    parserStates.set(operation, state);
+    return state;
+  }
+
+  function drainParserState(state: XcodebuildParserState): void {
+    while (state.bufferedFragments.length > 0) {
+      const fragment = state.bufferedFragments.shift();
+      if (fragment) {
+        const renderItem = domainFragmentToRenderItem(fragment);
+        if (renderItem) processItem(renderItem);
+      }
+    }
+  }
+
+  function flushParserStates(): void {
+    for (const state of parserStates.values()) {
+      state.parser.flush();
+      drainParserState(state);
+    }
+  }
+
+  return {
+    onFragment(fragment: AnyFragment): void {
+      const item = domainFragmentToRenderItem(fragment);
+      if (!item) return;
+      if (item.type === 'header') {
+        sawIncomingHeaderEvent = true;
+      }
+      if (item.type !== 'header') {
+        sawIncomingNonHeaderEvent = true;
+      }
+      processItem(item);
+    },
+
+    setStructuredOutput(output: StructuredToolOutput): void {
+      structuredOutput = output;
+    },
+
+    setNextSteps(steps: readonly NextStep[], runtime: 'cli' | 'daemon' | 'mcp'): void {
+      nextSteps = [...steps];
+      nextStepsRuntime = runtime;
     },
 
     finalize(): void {
+      flushParserStates();
+      if (structuredOutput) {
+        if (!sawIncomingNonHeaderEvent) {
+          const structuredItems = renderDomainResultTextItems(
+            structuredOutput.result,
+            structuredOutput.renderHints,
+          );
+          const replayItems =
+            sawIncomingHeaderEvent && structuredItems[0]?.type === 'header'
+              ? structuredItems.slice(1)
+              : structuredItems;
+          for (const item of replayItems) {
+            processItem(item);
+          }
+        } else {
+          const tailItems = createStreamingTailItems(structuredOutput.result);
+          for (const item of tailItems) {
+            processItem(item);
+          }
+        }
+      }
+      flushGroupedDiagnostics(true);
+      const nextStepsBlock = createNextStepsBlock(nextSteps, nextStepsRuntime);
+      if (nextStepsBlock && !sawProgressNextSteps) {
+        processItem(nextStepsBlock);
+      }
       sink.clearTransient();
       pendingTransientRuntimeLine = null;
       diagnosticBaseDir = null;
       hasDurableRuntimeContent = false;
       lastVisibleEventType = null;
       lastStatusLineLevel = null;
+      structuredOutput = undefined;
+      sawIncomingHeaderEvent = false;
+      sawIncomingNonHeaderEvent = false;
+      nextSteps = [];
+      nextStepsRuntime = undefined;
+      parserStates.clear();
+      sawProgressNextSteps = false;
     },
   };
 }
 
-export function createCliTextRenderer(options: CliTextRendererOptions): PipelineRenderer {
+export function createCliTextRenderer(options: CliTextRendererOptions): TranscriptRenderer {
   const reporter = createCliProgressReporter();
 
   return createCliTextProcessor({
@@ -272,14 +441,11 @@ export function createCliTextRenderer(options: CliTextRendererOptions): Pipeline
   });
 }
 
-export function renderCliTextTranscript(
-  events: readonly PipelineEvent[],
-  options: { suppressWarnings?: boolean } = {},
-): string {
+export function renderCliTextTranscript(input: CliTextTranscriptInput = {}): string {
   let output = '';
   const renderer = createCliTextProcessor({
     interactive: false,
-    suppressWarnings: options.suppressWarnings ?? false,
+    suppressWarnings: input.suppressWarnings ?? false,
     sink: {
       clearTransient(): void {},
       updateTransient(): void {},
@@ -292,10 +458,116 @@ export function renderCliTextTranscript(
     },
   });
 
-  for (const event of events) {
-    renderer.onEvent(event);
+  for (const item of input.items ?? []) {
+    renderer.onFragment(item);
+  }
+  if (input.structuredOutput) {
+    renderer.setStructuredOutput(input.structuredOutput);
+  }
+  if (input.nextSteps && input.nextSteps.length > 0) {
+    renderer.setNextSteps(input.nextSteps, input.nextStepsRuntime ?? 'cli');
   }
   renderer.finalize();
 
   return output;
+}
+
+function phaseDisplayMessage(phase: BuildRunPhase): string {
+  switch (phase) {
+    case 'resolve-app-path':
+      return 'Resolving app path';
+    case 'boot-simulator':
+      return 'Booting simulator';
+    case 'install-app':
+      return 'Installing app';
+    case 'launch-app':
+      return 'Launching app';
+  }
+}
+
+function domainFragmentToRenderItem(fragment: AnyFragment): RenderItem | null {
+  switch (fragment.fragment) {
+    case 'warning':
+      return { type: 'status', level: 'warning', message: fragment.message };
+    case 'phase':
+      return {
+        type: 'status',
+        level: fragment.status === 'started' ? 'info' : 'success',
+        message: phaseDisplayMessage(fragment.phase),
+      };
+    case 'build-stage':
+      return {
+        type: 'build-stage',
+        operation: fragment.operation,
+        stage: fragment.stage,
+        message: fragment.message,
+      };
+    case 'compiler-diagnostic':
+      if (fragment.severity === 'warning') {
+        return {
+          type: 'compiler-warning',
+          operation: fragment.operation,
+          message: fragment.message,
+          location: fragment.location,
+          rawLine: fragment.rawLine,
+        };
+      }
+      return {
+        type: 'compiler-error',
+        operation: fragment.operation,
+        message: fragment.message,
+        location: fragment.location,
+        rawLine: fragment.rawLine,
+      };
+    case 'build-summary':
+      return {
+        type: 'summary',
+        operation: fragment.operation,
+        status: fragment.status,
+        ...(fragment.totalTests !== undefined ? { totalTests: fragment.totalTests } : {}),
+        ...(fragment.passedTests !== undefined ? { passedTests: fragment.passedTests } : {}),
+        ...(fragment.failedTests !== undefined ? { failedTests: fragment.failedTests } : {}),
+        ...(fragment.skippedTests !== undefined ? { skippedTests: fragment.skippedTests } : {}),
+        ...(fragment.durationMs !== undefined ? { durationMs: fragment.durationMs } : {}),
+      };
+    case 'test-discovery':
+      return {
+        type: 'test-discovery',
+        operation: fragment.operation,
+        total: fragment.total,
+        tests: fragment.tests,
+        truncated: fragment.truncated,
+      };
+    case 'test-failure':
+      return {
+        type: 'test-failure',
+        operation: fragment.operation,
+        ...(fragment.target !== undefined ? { target: fragment.target } : {}),
+        ...(fragment.suite !== undefined ? { suite: fragment.suite } : {}),
+        ...(fragment.test !== undefined ? { test: fragment.test } : {}),
+        message: fragment.message,
+        ...(fragment.location !== undefined ? { location: fragment.location } : {}),
+        ...(fragment.durationMs !== undefined ? { durationMs: fragment.durationMs } : {}),
+      };
+    case 'status':
+      return { type: 'status', level: fragment.level, message: fragment.message };
+    case 'test-progress':
+      return {
+        type: 'test-progress',
+        operation: fragment.operation,
+        completed: fragment.completed,
+        failed: fragment.failed,
+        skipped: fragment.skipped,
+      };
+    case 'invocation':
+      return {
+        type: 'header',
+        operation: deriveBuildLikeTitle(fragment.kind, fragment.request),
+        params: invocationRequestToHeaderParams(fragment.request),
+      };
+    case 'process-command':
+    case 'process-line':
+    case 'process-exit':
+      return null;
+  }
 }

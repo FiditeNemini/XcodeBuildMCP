@@ -7,7 +7,7 @@ export function registerResourcesSnapshotSuite(): void {
 
   describe('mcp resources', () => {
     beforeAll(async () => {
-      await ensureSimulatorBooted('iPhone 17');
+      await ensureSimulatorBooted('iPhone 17 Pro');
     }, 30_000);
     describe('devices', () => {
       it('success', async () => {

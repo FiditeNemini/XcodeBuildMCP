@@ -2,20 +2,27 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { globSync } from 'glob';
 import type {
-  CompilerErrorEvent,
-  CompilerWarningEvent,
-  BuildStageEvent,
-  HeaderEvent,
-  StatusLineEvent,
-  SectionEvent,
-  TableEvent,
-  FileRefEvent,
-  DetailTreeEvent,
-  SummaryEvent,
-  TestDiscoveryEvent,
-  TestFailureEvent,
-  NextStepsEvent,
-} from '../../types/pipeline-events.ts';
+  ArtifactRenderItem,
+  BuildStageRenderItem,
+  CompilerErrorRenderItem,
+  CompilerWarningRenderItem,
+  DetailTreeRenderItem,
+  FileRefRenderItem,
+  HeaderRenderItem,
+  SectionRenderItem,
+  StatusRenderItem,
+  TableRenderItem,
+  TestDiscoveryRenderItem,
+  TestFailureRenderItem,
+} from '../../rendering/render-items.ts';
+import type {
+  DetailTreeTextBlock,
+  FileRefTextBlock,
+  NextStepsTextBlock,
+  SectionTextBlock,
+  SummaryTextBlock,
+  TableTextBlock,
+} from './domain-result-text.ts';
 import { displayPath } from '../build-preflight.ts';
 import { renderNextStepsSection } from '../responses/next-steps-renderer.ts';
 
@@ -180,7 +187,7 @@ function formatDiagnosticFilePath(filePath: string, options?: DiagnosticFormatti
 }
 
 function parseHumanDiagnostic(
-  event: CompilerWarningEvent | CompilerErrorEvent,
+  event: CompilerWarningRenderItem | CompilerErrorRenderItem,
   kind: 'warning' | 'error',
   options?: DiagnosticFormattingOptions,
 ): GroupedDiagnosticEntry {
@@ -209,17 +216,21 @@ function parseHumanDiagnostic(
 
 // --- Canonical event formatters ---
 
-export function formatHeaderEvent(event: HeaderEvent): string {
+export function formatHeaderEvent(event: HeaderRenderItem): string {
   const emoji = OPERATION_EMOJI[event.operation] ?? '\u{2699}\u{FE0F}';
-  const lines: string[] = [`${emoji} ${event.operation}`, ''];
+  const lines: string[] = [`${emoji} ${event.operation}`];
 
   const onlyTestingParams = event.params.filter((param) => param.label === '-only-testing');
   const skipTestingParams = event.params.filter((param) => param.label === '-skip-testing');
+  const regularParams = event.params.filter(
+    (param) => param.label !== '-only-testing' && param.label !== '-skip-testing',
+  );
 
-  for (const param of event.params) {
-    if (param.label === '-only-testing' || param.label === '-skip-testing') {
-      continue;
-    }
+  if (event.params.length > 0) {
+    lines.push('');
+  }
+
+  for (const param of regularParams) {
     lines.push(`   ${param.label}: ${param.value}`);
   }
 
@@ -233,13 +244,10 @@ export function formatHeaderEvent(event: HeaderEvent): string {
     }
   }
 
-  if (event.params.length > 0) {
-    lines.push('');
-  }
   return lines.join('\n');
 }
 
-export function formatStatusLineEvent(event: StatusLineEvent): string {
+export function formatStatusLineEvent(event: StatusRenderItem): string {
   switch (event.level) {
     case 'success':
       return `\u{2705} ${event.message}`;
@@ -252,7 +260,7 @@ export function formatStatusLineEvent(event: StatusLineEvent): string {
   }
 }
 
-const SECTION_ICON_MAP: Record<NonNullable<SectionEvent['icon']>, string> = {
+const SECTION_ICON_MAP: Record<NonNullable<SectionRenderItem['icon']>, string> = {
   'red-circle': '\u{1F534}',
   'yellow-circle': '\u{1F7E1}',
   'green-circle': '\u{1F7E2}',
@@ -261,7 +269,7 @@ const SECTION_ICON_MAP: Record<NonNullable<SectionEvent['icon']>, string> = {
   info: '\u{2139}\u{FE0F}',
 };
 
-export function formatSectionEvent(event: SectionEvent): string {
+export function formatSectionEvent(event: SectionRenderItem | SectionTextBlock): string {
   const icon = event.icon ? `${SECTION_ICON_MAP[event.icon]} ` : '';
   const headerLine = `${icon}${event.title}`;
   if (event.lines.length === 0) {
@@ -277,10 +285,12 @@ export function formatSectionEvent(event: SectionEvent): string {
   return lines.join('\n');
 }
 
-export function formatTableEvent(event: TableEvent): string {
+export function formatTableEvent(event: TableRenderItem | TableTextBlock): string {
   const lines: string[] = [];
-  if (event.heading) {
-    lines.push(event.heading);
+  const heading =
+    'heading' in event ? (event.heading ?? ('name' in event ? event.name : undefined)) : undefined;
+  if (heading) {
+    lines.push(heading);
     lines.push('');
   }
 
@@ -308,22 +318,25 @@ export function formatTableEvent(event: TableEvent): string {
   return lines.join('\n');
 }
 
-export function formatFileRefEvent(event: FileRefEvent): string {
+export function formatFileRefEvent(
+  event: ArtifactRenderItem | FileRefRenderItem | FileRefTextBlock,
+): string {
   const displayed = displayPath(event.path);
-  if (event.label) {
-    return `${event.label}: ${displayed}`;
+  const label = 'label' in event ? event.label : 'name' in event ? event.name : undefined;
+  if (label) {
+    return `${label}: ${displayed}`;
   }
   return displayed;
 }
 
-export function formatDetailTreeEvent(event: DetailTreeEvent): string {
+export function formatDetailTreeEvent(event: DetailTreeRenderItem | DetailTreeTextBlock): string {
   return formatDetailTreeLines(event.items).join('\n');
 }
 
 // --- Xcodebuild-specific formatters ---
 
 export function extractGroupedCompilerError(
-  event: CompilerErrorEvent,
+  event: CompilerErrorRenderItem,
   options?: DiagnosticFormattingOptions,
 ): GroupedDiagnosticEntry | null {
   const firstRawLine = event.rawLine.split('\n')[0].trim();
@@ -345,7 +358,7 @@ export function extractGroupedCompilerError(
 }
 
 export function formatGroupedCompilerErrors(
-  events: CompilerErrorEvent[],
+  events: CompilerErrorRenderItem[],
   options?: DiagnosticFormattingOptions,
 ): string {
   const hasFileLocated = events.some((e) => extractGroupedCompilerError(e, options) !== null);
@@ -375,10 +388,10 @@ export function formatGroupedCompilerErrors(
     lines.pop();
   }
 
-  return lines.join('\n') + '\n';
+  return lines.join('\n');
 }
 
-const BUILD_STAGE_LABEL: Record<Exclude<BuildStageEvent['stage'], 'COMPLETED'>, string> = {
+const BUILD_STAGE_LABEL: Record<Exclude<BuildStageRenderItem['stage'], 'COMPLETED'>, string> = {
   RESOLVING_PACKAGES: 'Resolving packages',
   COMPILING: 'Compiling',
   LINKING: 'Linking',
@@ -387,14 +400,14 @@ const BUILD_STAGE_LABEL: Record<Exclude<BuildStageEvent['stage'], 'COMPLETED'>, 
   ARCHIVING: 'Archiving',
 };
 
-export function formatBuildStageEvent(event: BuildStageEvent): string {
+export function formatBuildStageEvent(event: BuildStageRenderItem): string {
   if (event.stage === 'COMPLETED') {
     return event.message;
   }
   return `\u203A ${BUILD_STAGE_LABEL[event.stage]}`;
 }
 
-export function formatTransientBuildStageEvent(event: BuildStageEvent): string {
+export function formatTransientBuildStageEvent(event: BuildStageRenderItem): string {
   if (event.stage === 'COMPLETED') {
     return event.message;
   }
@@ -402,7 +415,7 @@ export function formatTransientBuildStageEvent(event: BuildStageEvent): string {
 }
 
 export function formatHumanCompilerWarningEvent(
-  event: CompilerWarningEvent,
+  event: CompilerWarningRenderItem,
   options?: DiagnosticFormattingOptions,
 ): string {
   const diagnostic = parseHumanDiagnostic(event, 'warning', options);
@@ -414,7 +427,7 @@ export function formatHumanCompilerWarningEvent(
 }
 
 export function formatGroupedWarnings(
-  events: CompilerWarningEvent[],
+  events: CompilerWarningRenderItem[],
   options?: DiagnosticFormattingOptions,
 ): string {
   const heading = `Warnings (${events.length}):`;
@@ -433,7 +446,7 @@ export function formatGroupedWarnings(
 }
 
 export function formatHumanCompilerErrorEvent(
-  event: CompilerErrorEvent,
+  event: CompilerErrorRenderItem,
   options?: DiagnosticFormattingOptions,
 ): string {
   const diagnostic = parseHumanDiagnostic(event, 'error', options);
@@ -442,7 +455,7 @@ export function formatHumanCompilerErrorEvent(
     : diagnostic.message;
 }
 
-export function formatTransientStatusLineEvent(event: StatusLineEvent): string | null {
+export function formatTransientStatusLineEvent(event: StatusRenderItem): string | null {
   if (event.level === 'info') {
     return `${event.message}...`;
   }
@@ -450,7 +463,7 @@ export function formatTransientStatusLineEvent(event: StatusLineEvent): string |
 }
 
 export function formatTestFailureEvent(
-  event: TestFailureEvent,
+  event: TestFailureRenderItem,
   options?: DiagnosticFormattingOptions,
 ): string {
   const parts: string[] = [];
@@ -480,7 +493,7 @@ function pluralize(count: number, singular: string, plural: string): string {
   return count === 1 ? `${count} ${singular}` : `${count} ${plural}`;
 }
 
-export function formatSummaryEvent(event: SummaryEvent): string {
+export function formatSummaryEvent(event: SummaryTextBlock): string {
   const succeeded = event.status === 'SUCCEEDED';
   const statusEmoji = succeeded ? '\u{2705}' : '\u{274C}';
   const durationPart =
@@ -512,7 +525,7 @@ export function formatSummaryEvent(event: SummaryEvent): string {
 
 const TEST_DISCOVERY_PREVIEW_LIMIT = 6;
 
-export function formatTestDiscoveryEvent(event: TestDiscoveryEvent): string {
+export function formatTestDiscoveryEvent(event: TestDiscoveryRenderItem): string {
   const visibleTests = event.tests.slice(0, TEST_DISCOVERY_PREVIEW_LIMIT);
   const lines = [`Discovered ${event.total} test(s):`];
 
@@ -533,23 +546,23 @@ export function formatTestDiscoveryEvent(event: TestDiscoveryEvent): string {
   return lines.join('\n');
 }
 
-export function formatNextStepsEvent(event: NextStepsEvent, runtime: 'cli' | 'mcp'): string {
+export function formatNextStepsEvent(event: NextStepsTextBlock, runtime: 'cli' | 'mcp'): string {
   return renderNextStepsSection(event.steps, runtime);
 }
 
 export function formatGroupedTestFailures(
-  events: TestFailureEvent[],
+  events: TestFailureRenderItem[],
   options?: DiagnosticFormattingOptions,
 ): string {
   if (events.length === 0) return '';
 
   const allUnnamedSuites = events.every((e) => e.suite === undefined);
 
-  const groupedSuites = new Map<string, Map<string, TestFailureEvent[]>>();
+  const groupedSuites = new Map<string, Map<string, TestFailureRenderItem[]>>();
   for (const event of events) {
     const suiteKey = event.suite ?? '(Unknown Suite)';
     const testKey = event.test ?? '(unknown test)';
-    const suiteGroup = groupedSuites.get(suiteKey) ?? new Map<string, TestFailureEvent[]>();
+    const suiteGroup = groupedSuites.get(suiteKey) ?? new Map<string, TestFailureRenderItem[]>();
     const testGroup = suiteGroup.get(testKey) ?? [];
     testGroup.push(event);
     suiteGroup.set(testKey, testGroup);

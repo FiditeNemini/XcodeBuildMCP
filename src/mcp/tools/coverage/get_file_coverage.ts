@@ -6,15 +6,21 @@
  */
 
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { BasicDiagnostics, CoverageResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import { validateFileExists } from '../../../utils/validation.ts';
 import type { CommandExecutor, FileSystemExecutor } from '../../../utils/execution/index.ts';
-import { getDefaultCommandExecutor, getDefaultFileSystemExecutor } from '../../../utils/execution/index.ts';
+import {
+  getDefaultCommandExecutor,
+  getDefaultFileSystemExecutor,
+} from '../../../utils/execution/index.ts';
 import {
   createTypedToolWithContext,
   getHandlerContext,
 } from '../../../utils/typed-tool-factory.ts';
-import { header, statusLine, section, fileRef } from '../../../utils/tool-event-builders.ts';
+import { createBasicDiagnostics, diagnosticsFromCommandFailure } from '../../../utils/diagnostics.ts';
 
 const getFileCoverageSchema = z.object({
   xcresultPath: z.string().describe('Path to the .xcresult bundle'),
@@ -27,6 +33,9 @@ const getFileCoverageSchema = z.object({
 });
 
 type GetFileCoverageParams = z.infer<typeof getFileCoverageSchema>;
+type GetFileCoverageResult = CoverageResultDomainResult & {
+  uncoveredLineRanges?: LineRange[];
+};
 
 interface CoverageFunction {
   coveredLines: number;
@@ -72,177 +81,221 @@ type GetFileCoverageContext = {
   fileSystem: FileSystemExecutor;
 };
 
+interface LineRange {
+  start: number;
+  end: number;
+}
+
+function createFileCoverageResult(params: {
+  xcresultPath: string;
+  file: string;
+  didError: boolean;
+  error?: string;
+  sourceFilePath?: string;
+  coveragePct?: number;
+  coveredLines?: number;
+  executableLines?: number;
+  functions?: NonNullable<GetFileCoverageResult['functions']>;
+  diagnostics?: BasicDiagnostics;
+  uncoveredLineRanges?: LineRange[];
+}): GetFileCoverageResult {
+  return {
+    kind: 'coverage-result',
+    didError: params.didError,
+    error: params.error ?? null,
+    summary: {
+      status: params.didError ? 'FAILED' : 'SUCCEEDED',
+      ...(typeof params.coveragePct === 'number' ? { coveragePct: params.coveragePct } : {}),
+      ...(typeof params.coveredLines === 'number' ? { coveredLines: params.coveredLines } : {}),
+      ...(typeof params.executableLines === 'number'
+        ? { executableLines: params.executableLines }
+        : {}),
+    },
+    coverageScope: 'file',
+    artifacts: {
+      xcresultPath: params.xcresultPath,
+      file: params.file,
+      ...(params.sourceFilePath ? { sourceFilePath: params.sourceFilePath } : {}),
+    },
+    ...(params.functions ? { functions: params.functions } : {}),
+    ...(params.diagnostics ? { diagnostics: params.diagnostics } : {}),
+    ...(params.uncoveredLineRanges !== undefined
+      ? { uncoveredLineRanges: params.uncoveredLineRanges }
+      : {}),
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: GetFileCoverageResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.coverage-result',
+    schemaVersion: '1',
+  };
+}
+
+function buildCoverageFunctions(entry: FileFunctionCoverage): NonNullable<GetFileCoverageResult['functions']> {
+  const notCovered = entry.functions
+    .filter((fn) => fn.coveredLines === 0)
+    .sort((a, b) => b.executableLines - a.executableLines || a.lineNumber - b.lineNumber)
+    .map((fn) => ({
+      line: fn.lineNumber,
+      name: fn.name,
+      coveredLines: fn.coveredLines,
+      executableLines: fn.executableLines,
+    }));
+
+  const partialCoverage = entry.functions
+    .filter((fn) => fn.coveredLines > 0 && fn.coveredLines < fn.executableLines)
+    .sort((a, b) => a.lineCoverage - b.lineCoverage || a.lineNumber - b.lineNumber)
+    .map((fn) => ({
+      line: fn.lineNumber,
+      name: fn.name,
+      coveragePct: Number((fn.lineCoverage * 100).toFixed(1)),
+      coveredLines: fn.coveredLines,
+      executableLines: fn.executableLines,
+    }));
+
+  const fullCoverageCount = entry.functions.filter(
+    (fn) => fn.executableLines > 0 && fn.coveredLines === fn.executableLines,
+  ).length;
+
+  return {
+    ...(notCovered.length > 0 ? { notCovered } : {}),
+    ...(partialCoverage.length > 0 ? { partialCoverage } : {}),
+    fullCoverageCount,
+    notCoveredFunctionCount: notCovered.length,
+    notCoveredLineCount: notCovered.reduce((sum, fn) => sum + fn.executableLines, 0),
+    partialCoverageFunctionCount: partialCoverage.length,
+  };
+}
+
+export function createGetFileCoverageExecutor(
+  context: GetFileCoverageContext,
+): NonStreamingExecutor<GetFileCoverageParams, GetFileCoverageResult> {
+  return async (params) => {
+    const { xcresultPath, file, showLines } = params;
+
+    const fileExistsValidation = validateFileExists(xcresultPath, context.fileSystem);
+    if (!fileExistsValidation.isValid) {
+      return createFileCoverageResult({
+        xcresultPath,
+        file,
+        didError: true,
+        error: fileExistsValidation.errorMessage!,
+        diagnostics: createBasicDiagnostics({ errors: [fileExistsValidation.errorMessage!] }),
+      });
+    }
+
+    log('info', `Getting file coverage for "${file}" from: ${xcresultPath}`);
+
+    const funcResult = await context.executor(
+      ['xcrun', 'xccov', 'view', '--report', '--functions-for-file', file, '--json', xcresultPath],
+      'Get File Function Coverage',
+      false,
+    );
+
+    if (!funcResult.success) {
+      return createFileCoverageResult({
+        xcresultPath,
+        file,
+        didError: true,
+        error: 'Failed to get file coverage.',
+        diagnostics: diagnosticsFromCommandFailure(funcResult),
+      });
+    }
+
+    let data: unknown;
+    try {
+      data = JSON.parse(funcResult.output);
+    } catch {
+      return createFileCoverageResult({
+        xcresultPath,
+        file,
+        didError: true,
+        error: 'Failed to parse coverage JSON output.',
+        diagnostics: createBasicDiagnostics({
+          errors: ['Failed to parse coverage JSON output.'],
+          rawOutput: funcResult.output,
+        }),
+      });
+    }
+
+    let fileEntries: FileFunctionCoverage[] = [];
+
+    if (Array.isArray(data)) {
+      fileEntries = (data as RawFileEntry[]).map(normalizeFileEntry);
+    } else if (
+      typeof data === 'object' &&
+      data !== null &&
+      'targets' in data &&
+      Array.isArray((data as { targets: unknown }).targets)
+    ) {
+      const targets = (data as { targets: unknown[] }).targets;
+      for (const targetEntry of targets) {
+        if (typeof targetEntry !== 'object' || targetEntry === null) continue;
+        const target = targetEntry as { files?: RawFileEntry[] };
+        if (target.files) {
+          fileEntries.push(...target.files.map(normalizeFileEntry));
+        }
+      }
+    }
+
+    if (fileEntries.length === 0) {
+      return createFileCoverageResult({
+        xcresultPath,
+        file,
+        didError: true,
+        error: `No coverage data found for "${file}".`,
+        diagnostics: createBasicDiagnostics({ errors: [`No coverage data found for "${file}".`] }),
+      });
+    }
+
+    const entry = fileEntries[0];
+    const functions = buildCoverageFunctions(entry);
+    let uncoveredLineRanges: LineRange[] | undefined;
+
+    if (showLines) {
+      const filePath = entry.filePath !== 'unknown' ? entry.filePath : file;
+      const archiveResult = await context.executor(
+        ['xcrun', 'xccov', 'view', '--archive', '--file', filePath, xcresultPath],
+        'Get File Line Coverage',
+        false,
+      );
+
+      if (archiveResult.success && archiveResult.output) {
+        uncoveredLineRanges = parseUncoveredLines(archiveResult.output);
+      }
+    }
+
+    return createFileCoverageResult({
+      xcresultPath,
+      file,
+      didError: false,
+      sourceFilePath: entry.filePath !== 'unknown' ? entry.filePath : undefined,
+      coveragePct: Number((entry.lineCoverage * 100).toFixed(1)),
+      coveredLines: entry.coveredLines,
+      executableLines: entry.executableLines,
+      functions,
+      ...(uncoveredLineRanges !== undefined ? { uncoveredLineRanges } : {}),
+    });
+  };
+}
+
 export async function get_file_coverageLogic(
   params: GetFileCoverageParams,
   context: GetFileCoverageContext,
 ): Promise<void> {
   const ctx = getHandlerContext();
-  const { xcresultPath, file, showLines } = params;
+  const { xcresultPath } = params;
+  const executeGetFileCoverage = createGetFileCoverageExecutor(context);
+  const result = await executeGetFileCoverage(params);
 
-  const headerEvent = header('File Coverage', [
-    { label: 'xcresult', value: xcresultPath },
-    { label: 'File', value: file },
-  ]);
-
-  const fileExistsValidation = validateFileExists(xcresultPath, context.fileSystem);
-  if (!fileExistsValidation.isValid) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', fileExistsValidation.errorMessage!));
-    return;
+  setStructuredOutput(ctx, result);
+  if (!result.didError) {
+    ctx.nextStepParams = {
+      get_coverage_report: { xcresultPath },
+    };
   }
-
-  log('info', `Getting file coverage for "${file}" from: ${xcresultPath}`);
-
-  const funcResult = await context.executor(
-    ['xcrun', 'xccov', 'view', '--report', '--functions-for-file', file, '--json', xcresultPath],
-    'Get File Function Coverage',
-    false,
-  );
-
-  if (!funcResult.success) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', `Failed to get file coverage: ${funcResult.error ?? funcResult.output}`));
-    return;
-  }
-
-  let data: unknown;
-  try {
-    data = JSON.parse(funcResult.output);
-  } catch {
-    ctx.emit(headerEvent);
-    ctx.emit(
-      statusLine('error', `Failed to parse coverage JSON output.\n\nRaw output:\n${funcResult.output}`),
-    );
-    return;
-  }
-
-  let fileEntries: FileFunctionCoverage[] = [];
-
-  if (Array.isArray(data)) {
-    fileEntries = (data as RawFileEntry[]).map(normalizeFileEntry);
-  } else if (
-    typeof data === 'object' &&
-    data !== null &&
-    'targets' in data &&
-    Array.isArray((data as { targets: unknown }).targets)
-  ) {
-    const targets = (data as { targets: unknown[] }).targets;
-    for (const t of targets) {
-      if (typeof t !== 'object' || t === null) continue;
-      const target = t as { files?: RawFileEntry[] };
-      if (target.files) {
-        fileEntries.push(...target.files.map(normalizeFileEntry));
-      }
-    }
-  }
-
-  if (fileEntries.length === 0) {
-    ctx.emit(headerEvent);
-    ctx.emit(
-      statusLine(
-        'error',
-        `No coverage data found for "${file}".\n\nMake sure the file name or path is correct and that tests covered this file.`,
-      ),
-    );
-    return;
-  }
-
-  ctx.emit(headerEvent);
-
-  for (const entry of fileEntries) {
-    const filePct = (entry.lineCoverage * 100).toFixed(1);
-    ctx.emit(fileRef(entry.filePath, 'File'));
-    ctx.emit(
-      statusLine(
-        'info',
-        `Coverage: ${filePct}% (${entry.coveredLines}/${entry.executableLines} lines)`,
-      ),
-    );
-
-    if (entry.functions && entry.functions.length > 0) {
-      const notCovered = entry.functions
-        .filter((fn) => fn.coveredLines === 0)
-        .sort((a, b) => b.executableLines - a.executableLines || a.lineNumber - b.lineNumber);
-
-      const partial = entry.functions
-        .filter((fn) => fn.coveredLines > 0 && fn.coveredLines < fn.executableLines)
-        .sort((a, b) => a.lineCoverage - b.lineCoverage || a.lineNumber - b.lineNumber);
-
-      const full = entry.functions.filter(
-        (fn) => fn.executableLines > 0 && fn.coveredLines === fn.executableLines,
-      );
-
-      if (notCovered.length > 0) {
-        const totalMissedLines = notCovered.reduce((sum, fn) => sum + fn.executableLines, 0);
-        const notCoveredLines = notCovered.map(
-          (fn) => `L${fn.lineNumber}  ${fn.name} -- 0/${fn.executableLines} lines`,
-        );
-        ctx.emit(
-          section(
-            `Not Covered (${notCovered.length} ${notCovered.length === 1 ? 'function' : 'functions'}, ${totalMissedLines} lines)`,
-            notCoveredLines,
-            { icon: 'red-circle' },
-          ),
-        );
-      }
-
-      if (partial.length > 0) {
-        const partialLines = partial.map((fn) => {
-          const fnPct = (fn.lineCoverage * 100).toFixed(1);
-          return `L${fn.lineNumber}  ${fn.name} -- ${fnPct}% (${fn.coveredLines}/${fn.executableLines} lines)`;
-        });
-        ctx.emit(
-          section(
-            `Partial Coverage (${partial.length} ${partial.length === 1 ? 'function' : 'functions'})`,
-            partialLines,
-            { icon: 'yellow-circle' },
-          ),
-        );
-      }
-
-      if (full.length > 0) {
-        ctx.emit(
-          section(
-            `Full Coverage (${full.length} ${full.length === 1 ? 'function' : 'functions'}) -- all at 100%`,
-            [],
-            { icon: 'green-circle' },
-          ),
-        );
-      }
-    }
-  }
-
-  if (showLines) {
-    const filePath = fileEntries[0].filePath !== 'unknown' ? fileEntries[0].filePath : file;
-    const archiveResult = await context.executor(
-      ['xcrun', 'xccov', 'view', '--archive', '--file', filePath, xcresultPath],
-      'Get File Line Coverage',
-      false,
-    );
-
-    if (archiveResult.success && archiveResult.output) {
-      const uncoveredRanges = parseUncoveredLines(archiveResult.output);
-      if (uncoveredRanges.length > 0) {
-        const rangeLines = uncoveredRanges.map((range) =>
-          range.start === range.end ? `L${range.start}` : `L${range.start}-${range.end}`,
-        );
-        ctx.emit(section(`Uncovered line ranges (${filePath})`, rangeLines));
-      } else {
-        ctx.emit(statusLine('success', 'All executable lines are covered.'));
-      }
-    } else {
-      ctx.emit(statusLine('warning', 'Could not retrieve line-level coverage from archive.'));
-    }
-  }
-
-  ctx.nextStepParams = {
-    get_coverage_report: { xcresultPath },
-  };
-}
-
-interface LineRange {
-  start: number;
-  end: number;
 }
 
 /**
@@ -273,11 +326,9 @@ function parseUncoveredLines(output: string): LineRange[] {
       } else {
         currentRange = { start: lineNum, end: lineNum };
       }
-    } else {
-      if (currentRange) {
-        ranges.push(currentRange);
-        currentRange = null;
-      }
+    } else if (currentRange) {
+      ranges.push(currentRange);
+      currentRange = null;
     }
   }
 

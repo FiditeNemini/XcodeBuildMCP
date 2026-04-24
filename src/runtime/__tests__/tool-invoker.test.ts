@@ -1,20 +1,27 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { ToolResponse } from '../../types/common.ts';
-import type { PipelineEvent } from '../../types/pipeline-events.ts';
-import type { DaemonToolResult } from '../../daemon/protocol.ts';
+import type { AnyFragment, DomainFragment } from '../../types/domain-fragments.ts';
+import type { RuntimeStatusFragment } from '../../types/runtime-status.ts';
+import type { DaemonToolResult, ToolInvokeResult } from '../../daemon/protocol.ts';
 import type { ToolDefinition } from '../types.ts';
 import { createToolCatalog } from '../tool-catalog.ts';
 import { DefaultToolInvoker } from '../tool-invoker.ts';
 import { createRenderSession } from '../../rendering/render.ts';
 import { ensureDaemonRunning } from '../../cli/daemon-control.ts';
-import { statusLine } from '../../utils/tool-event-builders.ts';
 
 const daemonClientMock = {
   isRunning: vi.fn<() => Promise<boolean>>(),
   invokeXcodeIdeTool:
     vi.fn<(name: string, args: Record<string, unknown>) => Promise<DaemonToolResult>>(),
-  invokeTool: vi.fn<(name: string, args: Record<string, unknown>) => Promise<DaemonToolResult>>(),
+  invokeTool:
+    vi.fn<
+      (
+        name: string,
+        args: Record<string, unknown>,
+        options?: { onFragment?: (fragment: AnyFragment) => void },
+      ) => Promise<ToolInvokeResult>
+    >(),
   listTools: vi.fn<() => Promise<Array<{ name: string }>>>(),
 };
 
@@ -37,17 +44,40 @@ vi.mock('../../cli/daemon-control.ts', () => ({
   DEFAULT_DAEMON_STARTUP_TIMEOUT_MS: 5000,
 }));
 
+function statusFragment(
+  level: 'info' | 'warning' | 'error' | 'success',
+  message: string,
+): RuntimeStatusFragment {
+  return { kind: 'infrastructure', fragment: 'status', level, message };
+}
+
 function daemonResult(text: string, opts?: Partial<DaemonToolResult>): DaemonToolResult {
   return {
-    events: [
+    fragments: [
       {
-        type: 'status-line',
-        timestamp: new Date().toISOString(),
+        kind: 'infrastructure',
+        fragment: 'status',
         level: 'success',
         message: text,
       },
     ],
     isError: false,
+    ...opts,
+  };
+}
+
+function streamedToolResult(opts: Partial<ToolInvokeResult> = {}): ToolInvokeResult {
+  return {
+    structuredOutput: {
+      schema: 'xcodebuildmcp.output.simulator-list',
+      schemaVersion: '1',
+      result: {
+        kind: 'simulator-list',
+        didError: false,
+        error: null,
+        simulators: [],
+      },
+    },
     ...opts,
   };
 }
@@ -92,25 +122,23 @@ function invokeAndFinalize(
   const promise = invoker.invoke(toolName, args, { ...opts, renderSession: session });
   return promise.then(() => {
     const text = session.finalize();
-    const events = [...session.getEvents()];
     return {
       content: text ? [{ type: 'text' as const, text }] : [],
       isError: session.isError() || undefined,
       nextSteps: undefined as ToolResponse['nextSteps'],
-      ...(events.length > 0 ? { _meta: { events } } : {}),
     } as ToolResponse;
   });
 }
 
 function emitHandler(text: string): ToolDefinition['handler'] {
   return vi.fn(async (_params, ctx) => {
-    ctx.emit(statusLine('success', text));
+    ctx.emit(statusFragment('success', text));
   });
 }
 
 function emitErrorHandler(text: string): ToolDefinition['handler'] {
   return vi.fn(async (_params, ctx) => {
-    ctx.emit(statusLine('error', text));
+    ctx.emit(statusFragment('error', text));
   });
 }
 
@@ -120,13 +148,13 @@ function emitNextStepsHandler(
   nextStepParams?: ToolResponse['nextStepParams'],
 ): ToolDefinition['handler'] {
   return vi.fn(async (_params, ctx) => {
-    ctx.emit(statusLine('success', text));
+    ctx.emit(statusFragment('success', text));
     if (nextSteps) ctx.nextSteps = nextSteps;
     if (nextStepParams) ctx.nextStepParams = nextStepParams;
   });
 }
 
-function emitErrorEventsHandler(events: PipelineEvent[]): ToolDefinition['handler'] {
+function emitErrorEventsHandler(events: AnyFragment[]): ToolDefinition['handler'] {
   return vi.fn(async (_params, ctx) => {
     for (const event of events) {
       ctx.emit(event);
@@ -139,7 +167,15 @@ describe('DefaultToolInvoker CLI routing', () => {
     vi.clearAllMocks();
     daemonClientMock.isRunning.mockResolvedValue(true);
     daemonClientMock.invokeXcodeIdeTool.mockResolvedValue(daemonResult('daemon-xcode-ide-result'));
-    daemonClientMock.invokeTool.mockResolvedValue(daemonResult('daemon-result'));
+    daemonClientMock.invokeTool.mockImplementation(async (_name, _args, options) => {
+      options?.onFragment?.({
+        kind: 'infrastructure',
+        fragment: 'status',
+        level: 'info',
+        message: 'daemon-result',
+      });
+      return streamedToolResult();
+    });
     daemonClientMock.listTools.mockResolvedValue([]);
   });
 
@@ -177,6 +213,58 @@ describe('DefaultToolInvoker CLI routing', () => {
     expect(response.content[0].text).toContain('direct-result');
   });
 
+  it('injects direct invocation progress and structured output hooks into the handler context', async () => {
+    const progressEvents: Array<{ kind: string }> = [];
+    const structuredOutputs: string[] = [];
+    const handler = vi.fn(async (_params, ctx) => {
+      ctx.emit(statusFragment('info', 'Working'));
+      ctx.structuredOutput = {
+        schema: 'xcodebuildmcp.output.simulator-list',
+        schemaVersion: '1',
+        result: {
+          kind: 'simulator-list',
+          didError: false,
+          error: null,
+          simulators: [],
+        },
+      };
+    });
+
+    const catalog = createToolCatalog([
+      makeTool({
+        cliName: 'list-sims',
+        workflow: 'simulator',
+        stateful: false,
+        handler,
+      }),
+    ]);
+    const invoker = new DefaultToolInvoker(catalog);
+
+    await invoker.invokeDirect(
+      catalog.tools[0],
+      {},
+      {
+        runtime: 'cli',
+        renderSession: createRenderSession('text'),
+        onProgress: (fragment) => {
+          progressEvents.push({ kind: fragment.kind });
+        },
+        onStructuredOutput: (output) => {
+          structuredOutputs.push(output.schema);
+        },
+      },
+    );
+
+    expect(handler).toHaveBeenCalledWith(
+      {},
+      expect.objectContaining({
+        emit: expect.any(Function),
+      }),
+    );
+    expect(progressEvents).toEqual([{ kind: 'infrastructure' }]);
+    expect(structuredOutputs).toEqual(['xcodebuildmcp.output.simulator-list']);
+  });
+
   it('routes stateful tools through daemon and auto-starts when needed', async () => {
     daemonClientMock.isRunning.mockResolvedValue(false);
     const directHandler = emitHandler('direct-result');
@@ -208,11 +296,52 @@ describe('DefaultToolInvoker CLI routing', () => {
         env: undefined,
       }),
     );
-    expect(daemonClientMock.invokeTool).toHaveBeenCalledWith('start_sim_log_cap', {
-      value: 'hello',
-    });
+    expect(daemonClientMock.invokeTool).toHaveBeenCalledWith(
+      'start_sim_log_cap',
+      {
+        value: 'hello',
+      },
+      expect.objectContaining({
+        onFragment: expect.any(Function),
+      }),
+    );
     expect(directHandler).not.toHaveBeenCalled();
     expect(response.content[0].text).toContain('daemon-result');
+  });
+
+  it('renders streamed daemon progress without relying on terminal event replay', async () => {
+    daemonClientMock.invokeTool.mockImplementation(async (_name, _args, options) => {
+      options?.onFragment?.({
+        kind: 'infrastructure',
+        fragment: 'status',
+        level: 'success',
+        message: 'daemon-event-result',
+      });
+      return streamedToolResult();
+    });
+    const directHandler = emitHandler('direct-result');
+    const catalog = createToolCatalog([
+      makeTool({
+        cliName: 'start-sim-log-cap',
+        workflow: 'logging',
+        stateful: true,
+        handler: directHandler,
+      }),
+    ]);
+    const invoker = new DefaultToolInvoker(catalog);
+
+    const response = await invokeAndFinalize(
+      invoker,
+      'start-sim-log-cap',
+      { value: 'hello' },
+      {
+        runtime: 'cli',
+        socketPath: '/tmp/xcodebuildmcp.sock',
+        workspaceRoot: '/repo',
+      },
+    );
+
+    expect(response.content[0].text).toContain('daemon-event-result');
   });
 });
 
@@ -221,7 +350,7 @@ describe('DefaultToolInvoker xcode-ide dynamic routing', () => {
     vi.clearAllMocks();
     daemonClientMock.isRunning.mockResolvedValue(true);
     daemonClientMock.invokeXcodeIdeTool.mockResolvedValue(daemonResult('daemon-result'));
-    daemonClientMock.invokeTool.mockResolvedValue(daemonResult('daemon-generic'));
+    daemonClientMock.invokeTool.mockResolvedValue(streamedToolResult());
     daemonClientMock.listTools.mockResolvedValue([]);
   });
 
@@ -478,7 +607,7 @@ describe('DefaultToolInvoker next steps post-processing', () => {
 
   it('preserves daemon-provided next-step params when nextStepParams are already consumed', async () => {
     daemonClientMock.invokeTool.mockResolvedValue(
-      daemonResult('ok', {
+      streamedToolResult({
         nextSteps: [
           {
             tool: 'stop_sim_log_cap',
@@ -628,8 +757,8 @@ describe('DefaultToolInvoker next steps post-processing', () => {
   it('renders failure next steps for ordinary error responses with replayable events', async () => {
     const directHandler = emitErrorEventsHandler([
       {
-        type: 'status-line',
-        timestamp: new Date().toISOString(),
+        kind: 'infrastructure',
+        fragment: 'status',
         level: 'error',
         message: 'failed',
       },
@@ -671,28 +800,34 @@ describe('DefaultToolInvoker next steps post-processing', () => {
   });
 
   it('suppresses failure next steps for structured xcodebuild failures emitted via handler context', async () => {
-    const directHandler = emitErrorEventsHandler([
-      {
-        type: 'header',
-        timestamp: '2026-03-20T12:00:00.000Z',
-        operation: 'Build',
-        params: [{ label: 'Scheme', value: 'MyApp' }],
-      },
-      {
-        type: 'compiler-error',
-        timestamp: '2026-03-20T12:00:00.500Z',
+    const directHandler: ToolDefinition['handler'] = vi.fn(async (_params, ctx) => {
+      ctx.emit({
+        kind: 'build-result',
+        fragment: 'invocation',
         operation: 'BUILD',
+        request: { scheme: 'MyApp' },
+      } as DomainFragment);
+      ctx.emit({
+        kind: 'build-result',
+        fragment: 'compiler-diagnostic',
+        operation: 'BUILD',
+        severity: 'error',
         message: 'Build failed',
         rawLine: 'Build failed',
-      },
-      {
-        type: 'summary',
-        timestamp: '2026-03-20T12:00:01.000Z',
-        status: 'FAILED',
-        operation: 'BUILD',
-        durationMs: 1000,
-      },
-    ]);
+      } as DomainFragment);
+      ctx.structuredOutput = {
+        schema: 'xcodebuildmcp.output.build-result',
+        schemaVersion: '1',
+        result: {
+          kind: 'build-result',
+          didError: true,
+          error: 'Build failed',
+          summary: { status: 'FAILED', durationMs: 1000 },
+          artifacts: {},
+          diagnostics: { warnings: [], errors: [] },
+        },
+      };
+    });
 
     const catalog = createToolCatalog([
       makeTool({

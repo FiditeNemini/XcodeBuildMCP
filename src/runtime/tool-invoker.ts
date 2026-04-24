@@ -1,7 +1,8 @@
 import type { ToolCatalog, ToolDefinition, ToolInvoker, InvokeOptions } from './types.ts';
 import type { NextStep, NextStepParams, NextStepParamsMap } from '../types/common.ts';
-import type { DaemonToolResult } from '../daemon/protocol.ts';
-import { statusLine } from '../utils/tool-event-builders.ts';
+import type { DaemonToolResult, ToolInvokeResult } from '../daemon/protocol.ts';
+import type { RuntimeStatusFragment } from '../types/runtime-status.ts';
+
 import { DaemonClient, DaemonVersionMismatchError } from '../cli/daemon-client.ts';
 import {
   ensureDaemonRunning,
@@ -23,6 +24,18 @@ type BuiltTemplateNextStep = {
   step: NextStep;
   templateToolId?: string;
 };
+
+function createStatusFragment(
+  level: RuntimeStatusFragment['level'],
+  message: string,
+): RuntimeStatusFragment {
+  return {
+    kind: 'infrastructure',
+    fragment: 'status',
+    level,
+    message,
+  };
+}
 
 function buildTemplateNextSteps(
   tool: ToolDefinition,
@@ -136,14 +149,16 @@ function normalizeNextSteps(steps: NextStep[], catalog: ToolCatalog): NextStep[]
 }
 
 function isStructuredXcodebuildFailureSession(session: RenderSession): boolean {
-  const events = session.getEvents();
+  const structuredOutput = session.getStructuredOutput?.();
+  if (!structuredOutput?.result.didError) {
+    return false;
+  }
 
-  const hasFailedSummary = events.some(
-    (event) => event.type === 'summary' && event.status === 'FAILED',
+  return (
+    structuredOutput.result.kind === 'build-result' ||
+    structuredOutput.result.kind === 'build-run-result' ||
+    structuredOutput.result.kind === 'test-result'
   );
-  const hasHeader = events.some((event) => event.type === 'header');
-
-  return hasFailedSummary && hasHeader;
 }
 
 function buildEffectiveNextStepParams(
@@ -219,12 +234,7 @@ export function postProcessSession(params: {
   const normalized = normalizeNextSteps(finalSteps, catalog);
 
   if (normalized.length > 0) {
-    session.emit({
-      type: 'next-steps',
-      timestamp: new Date().toISOString(),
-      steps: normalized,
-      runtime,
-    });
+    session.setNextSteps?.(normalized, runtime);
   }
 }
 
@@ -260,7 +270,7 @@ export class DefaultToolInvoker implements ToolInvoker {
 
     if (resolved.ambiguous) {
       session.emit(
-        statusLine(
+        createStatusFragment(
           'error',
           `Ambiguous tool name: Multiple tools match '${toolName}'. Use one of:\n- ${resolved.ambiguous.join('\n- ')}`,
         ),
@@ -270,7 +280,7 @@ export class DefaultToolInvoker implements ToolInvoker {
 
     if (resolved.notFound || !resolved.tool) {
       session.emit(
-        statusLine(
+        createStatusFragment(
           'error',
           `Tool not found: Unknown tool '${toolName}'. Run 'xcodebuildmcp tools' to see available tools.`,
         ),
@@ -290,14 +300,15 @@ export class DefaultToolInvoker implements ToolInvoker {
     return this.executeTool(tool, args, { ...opts, renderSession: session });
   }
 
-  private async invokeViaDaemon(
+  private async invokeViaDaemon<TResult>(
     opts: InvokeOptions,
-    invoke: (client: DaemonClient) => Promise<DaemonToolResult>,
+    invoke: (client: DaemonClient) => Promise<TResult>,
     context: {
       label: string;
       errorTitle: string;
       captureInfraErrorMetric: (error: unknown) => void;
       captureInvocationMetric: (outcome: SentryToolInvocationOutcome) => void;
+      consumeResult: (result: TResult) => void;
       postProcessParams: {
         tool: ToolDefinition;
         catalog: ToolCatalog;
@@ -312,7 +323,7 @@ export class DefaultToolInvoker implements ToolInvoker {
       context.captureInfraErrorMetric(error);
       context.captureInvocationMetric('infra_error');
       session.emit(
-        statusLine(
+        createStatusFragment(
           'error',
           'Socket path required: No socket path configured for daemon communication.',
         ),
@@ -340,7 +351,7 @@ export class DefaultToolInvoker implements ToolInvoker {
         context.captureInfraErrorMetric(error);
         context.captureInvocationMetric('infra_error');
         session.emit(
-          statusLine(
+          createStatusFragment(
             'error',
             `Daemon auto-start failed: ${error instanceof Error ? error.message : String(error)}\n\nYou can try starting the daemon manually:\n  xcodebuildmcp daemon start`,
           ),
@@ -349,29 +360,10 @@ export class DefaultToolInvoker implements ToolInvoker {
       }
     }
 
-    const consumeResult = (daemonResult: DaemonToolResult): void => {
-      for (const event of daemonResult.events) {
-        session.emit(event);
-      }
-
-      const ctx: ToolHandlerContext = {
-        emit: (event) => session.emit(event),
-        attach: (image) => session.attach(image),
-        nextStepParams: daemonResult.nextStepParams,
-        nextSteps: daemonResult.nextSteps,
-      };
-
-      postProcessSession({
-        ...context.postProcessParams,
-        session,
-        ctx,
-      });
-    };
-
     try {
       const daemonResult = await invoke(client);
       context.captureInvocationMetric('completed');
-      consumeResult(daemonResult);
+      context.consumeResult(daemonResult);
     } catch (error) {
       if (error instanceof DaemonVersionMismatchError) {
         log('info', `[infra/tool-invoker] ${context.label} daemon protocol mismatch, restarting`);
@@ -386,7 +378,7 @@ export class DefaultToolInvoker implements ToolInvoker {
           const retryClient = new DaemonClient({ socketPath });
           const daemonResult = await invoke(retryClient);
           context.captureInvocationMetric('completed');
-          consumeResult(daemonResult);
+          context.consumeResult(daemonResult);
           return;
         } catch (retryError) {
           log(
@@ -397,7 +389,7 @@ export class DefaultToolInvoker implements ToolInvoker {
           context.captureInfraErrorMetric(retryError);
           context.captureInvocationMetric('infra_error');
           session.emit(
-            statusLine(
+            createStatusFragment(
               'error',
               `Daemon restart failed after protocol mismatch: ${retryError instanceof Error ? retryError.message : String(retryError)}\n\nTry restarting manually:\n  xcodebuildmcp daemon stop && xcodebuildmcp daemon start`,
             ),
@@ -414,7 +406,7 @@ export class DefaultToolInvoker implements ToolInvoker {
       context.captureInfraErrorMetric(error);
       context.captureInvocationMetric('infra_error');
       session.emit(
-        statusLine(
+        createStatusFragment(
           'error',
           `${context.errorTitle}: ${error instanceof Error ? error.message : String(error)}`,
         ),
@@ -464,34 +456,101 @@ export class DefaultToolInvoker implements ToolInvoker {
           errorTitle: 'Xcode IDE invocation failed',
           captureInfraErrorMetric,
           captureInvocationMetric,
+          consumeResult: (daemonResult: DaemonToolResult) => {
+            for (const fragment of daemonResult.fragments ?? []) {
+              opts.renderSession!.emit(fragment);
+            }
+
+            const ctx: ToolHandlerContext = {
+              liveProgressEnabled: opts.handlerContext?.liveProgressEnabled ?? false,
+              streamingFragmentsEnabled: opts.handlerContext?.liveProgressEnabled ?? false,
+              emit: (fragment) => {
+                opts.renderSession!.emit(fragment);
+              },
+              attach: (image) => opts.renderSession!.attach(image),
+              nextStepParams: daemonResult.nextStepParams,
+              nextSteps: daemonResult.nextSteps,
+            };
+
+            postProcessSession({
+              ...postProcessParams,
+              session: opts.renderSession!,
+              ctx,
+            });
+          },
           postProcessParams,
         },
       );
     }
 
     if (opts.runtime === 'cli' && tool.stateful) {
+      const session = opts.renderSession!;
+
       transport = 'daemon';
-      return this.invokeViaDaemon(opts, (client) => client.invokeTool(tool.mcpName, args), {
-        label: `daemon/${tool.mcpName}`,
-        errorTitle: 'Daemon invocation failed',
-        captureInfraErrorMetric,
-        captureInvocationMetric,
-        postProcessParams,
-      });
+      return this.invokeViaDaemon(
+        opts,
+        (client) =>
+          client.invokeTool(tool.mcpName, args, {
+            onFragment: (fragment) => {
+              session.emit(fragment);
+              opts.onProgress?.(fragment);
+            },
+          }),
+        {
+          label: `daemon/${tool.mcpName}`,
+          errorTitle: 'Daemon invocation failed',
+          captureInfraErrorMetric,
+          captureInvocationMetric,
+          consumeResult: (daemonResult: ToolInvokeResult) => {
+            if (daemonResult.structuredOutput) {
+              session.setStructuredOutput?.(daemonResult.structuredOutput);
+              opts.onStructuredOutput?.(daemonResult.structuredOutput);
+            }
+
+            const ctx: ToolHandlerContext = {
+              liveProgressEnabled: opts.handlerContext?.liveProgressEnabled ?? false,
+              streamingFragmentsEnabled: opts.handlerContext?.liveProgressEnabled ?? false,
+              emit: (fragment) => {
+                session.emit(fragment);
+              },
+              attach: (image) => session.attach(image),
+              nextStepParams: daemonResult.nextStepParams,
+              nextSteps: daemonResult.nextSteps,
+              structuredOutput: daemonResult.structuredOutput ?? undefined,
+            };
+
+            postProcessSession({
+              ...postProcessParams,
+              session,
+              ctx,
+            });
+          },
+          postProcessParams,
+        },
+      );
     }
 
     // Direct invocation (CLI stateless or daemon internal)
     const session = opts.renderSession!;
     try {
       const ctx: ToolHandlerContext = opts.handlerContext ?? {
-        emit: (event) => {
-          session.emit(event);
+        liveProgressEnabled: false,
+        streamingFragmentsEnabled: false,
+        emit: (fragment) => {
+          session.emit(fragment);
+          opts.onProgress?.(fragment);
         },
         attach: (image) => {
           session.attach(image);
         },
       };
+
       await tool.handler(args, ctx);
+
+      if (ctx.structuredOutput) {
+        session.setStructuredOutput?.(ctx.structuredOutput);
+        opts.onStructuredOutput?.(ctx.structuredOutput);
+      }
 
       captureInvocationMetric('completed');
 
@@ -510,8 +569,11 @@ export class DefaultToolInvoker implements ToolInvoker {
       );
       captureInfraErrorMetric(error);
       captureInvocationMetric('infra_error');
+      if (opts.runtime === 'daemon') {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
       const message = error instanceof Error ? error.message : String(error);
-      session.emit(statusLine('error', `Tool execution failed: ${message}`));
+      session.emit(createStatusFragment('error', `Tool execution failed: ${message}`));
     }
   }
 }

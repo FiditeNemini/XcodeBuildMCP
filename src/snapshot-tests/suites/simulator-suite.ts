@@ -12,6 +12,7 @@ const WORKSPACE = 'example_projects/iOS_Calculator/CalculatorApp.xcworkspace';
 const SCHEME = 'CalculatorApp';
 const INVALID_SCHEME = 'NONEXISTENT';
 const SIMULATOR_NAME = 'iPhone 17';
+const PRIMARY_BOOTED_SIMULATOR = 'iPhone 17 Pro';
 const IOS_SIMULATOR_PLATFORM = 'iOS Simulator';
 const CALCULATOR_BUNDLE_ID = 'io.sentry.calculatorapp';
 const NONEXISTENT_BUNDLE_ID = 'com.nonexistent.app';
@@ -26,7 +27,7 @@ export function registerSimulatorSnapshotSuite(runtime: SnapshotRuntime): void {
     beforeAll(async () => {
       vi.setConfig({ testTimeout: TEST_TIMEOUT_MS });
       harness = await createHarnessForRuntime(runtime);
-      simulatorUdid = await ensureSimulatorBooted(SIMULATOR_NAME);
+      simulatorUdid = await ensureSimulatorBooted(PRIMARY_BOOTED_SIMULATOR);
     }, TEST_TIMEOUT_MS);
 
     afterAll(async () => {
@@ -176,16 +177,12 @@ export function registerSimulatorSnapshotSuite(runtime: SnapshotRuntime): void {
     });
 
     describe('list', () => {
-      it(
-        'success',
-        async () => {
-          const { text, isError } = await harness.invoke('simulator', 'list', {});
-          expect(isError).toBe(false);
-          expect(text.length).toBeGreaterThan(10);
-          expectFixture(text, 'list--success');
-        },
-        TEST_TIMEOUT_MS,
-      );
+      it('success', async () => {
+        const { text, isError } = await harness.invoke('simulator', 'list', {});
+        expect(isError).toBe(false);
+        expect(text.length).toBeGreaterThan(10);
+        expectFixture(text, 'list--success');
+      });
     });
 
     describe('install', () => {
@@ -322,7 +319,7 @@ export function registerSimulatorSnapshotSuite(runtime: SnapshotRuntime): void {
       );
     });
 
-    if (runtime === 'mcp') {
+    if (runtime !== 'cli') {
       describe('mcp-only extras', () => {
         beforeEach(async () => {
           await harness.invoke('session-management', 'clear-defaults', { all: true });
@@ -332,6 +329,13 @@ export function registerSimulatorSnapshotSuite(runtime: SnapshotRuntime): void {
         // validates and hydrates arguments differently. This makes the empty-args build failure
         // a transport-specific MCP snapshot rather than a shared CLI/MCP parity case.
         it('build -- error missing params', async () => {
+          if (runtime === 'json') {
+            await expect(harness.invoke('simulator', 'build', {})).rejects.toThrow(
+              'Structured output missing for simulator/build',
+            );
+            return;
+          }
+
           const { text, isError } = await harness.invoke('simulator', 'build', {});
           expect(isError).toBe(true);
           expectFixture(text, 'build--error-missing-params');

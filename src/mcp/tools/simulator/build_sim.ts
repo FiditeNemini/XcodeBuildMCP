@@ -7,6 +7,8 @@
  */
 
 import * as z from 'zod';
+import type { BuildResultDomainResult } from '../../../types/domain-results.ts';
+import type { StreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import { executeXcodeBuildCommand } from '../../../utils/build/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
@@ -15,12 +17,23 @@ import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
-import { inferPlatform } from '../../../utils/infer-platform.ts';
-import { startBuildPipeline } from '../../../utils/xcodebuild-pipeline.ts';
-import { finalizeInlineXcodebuild } from '../../../utils/xcodebuild-output.ts';
-import { formatToolPreflight } from '../../../utils/build-preflight.ts';
+import {
+  nullifyEmptyStrings,
+  withProjectOrWorkspace,
+  withSimulatorIdOrName,
+} from '../../../utils/schema-helpers.ts';
+import { inferPlatform, type InferPlatformResult } from '../../../utils/infer-platform.ts';
+import {
+  collectFallbackErrorMessages,
+  createBuildDomainResult,
+  createStreamingExecutionContext,
+  createDomainStreamingPipeline,
+  setXcodebuildStructuredOutput,
+} from '../../../utils/xcodebuild-domain-results.ts';
+import type { BuildInvocationRequest } from '../../../types/domain-fragments.ts';
+import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
 
 const baseOptions = {
   scheme: z.string().describe('The scheme to use (Required)'),
@@ -60,40 +73,34 @@ const baseSchemaObject = z.object({
 
 const buildSimulatorSchema = z.preprocess(
   nullifyEmptyStrings,
-  baseSchemaObject
-    .refine((val) => val.projectPath !== undefined || val.workspacePath !== undefined, {
-      message: 'Either projectPath or workspacePath is required.',
-    })
-    .refine((val) => !(val.projectPath !== undefined && val.workspacePath !== undefined), {
-      message: 'projectPath and workspacePath are mutually exclusive. Provide only one.',
-    })
-    .refine((val) => val.simulatorId !== undefined || val.simulatorName !== undefined, {
-      message: 'Either simulatorId or simulatorName is required.',
-    })
-    .refine((val) => !(val.simulatorId !== undefined && val.simulatorName !== undefined), {
-      message: 'simulatorId and simulatorName are mutually exclusive. Provide only one.',
-    }),
+  withSimulatorIdOrName(withProjectOrWorkspace(baseSchemaObject)),
 );
 
 export type BuildSimulatorParams = z.infer<typeof buildSimulatorSchema>;
+type BuildSimulatorResult = BuildResultDomainResult;
 
-export async function build_simLogic(
+interface PreparedBuildSimExecution {
+  configuration: string;
+  detectedPlatform: InferPlatformResult['platform'];
+  platformName: string;
+  sharedBuildParams: BuildSimulatorParams & { configuration: string };
+  platformOptions: {
+    platform: InferPlatformResult['platform'];
+    simulatorName?: string;
+    simulatorId?: string;
+    useLatestOS: boolean;
+    logPrefix: string;
+  };
+  invocationRequest: BuildInvocationRequest;
+  warningMessage?: string;
+}
+
+async function prepareBuildSimExecution(
   params: BuildSimulatorParams,
   executor: CommandExecutor,
-): Promise<void> {
-  const ctx = getHandlerContext();
+): Promise<PreparedBuildSimExecution> {
   const configuration = params.configuration ?? 'Debug';
   const useLatestOS = params.useLatestOS ?? true;
-  const projectType = params.projectPath ? 'project' : 'workspace';
-  const filePath = params.projectPath ?? params.workspacePath;
-
-  if (params.simulatorId && params.useLatestOS !== undefined) {
-    log(
-      'warn',
-      'useLatestOS parameter is ignored when using simulatorId (UUID implies exact device/OS)',
-    );
-  }
-
   const inferred = await inferPlatform(
     {
       projectPath: params.projectPath,
@@ -106,79 +113,33 @@ export async function build_simLogic(
   );
   const detectedPlatform = inferred.platform;
   const platformName = detectedPlatform.replace(' Simulator', '');
-  const logPrefix = `${platformName} Simulator Build`;
 
-  log('info', `Starting ${logPrefix} for scheme ${params.scheme} from ${projectType}: ${filePath}`);
-  log('info', `Inferred simulator platform: ${detectedPlatform} (source: ${inferred.source})`);
-
-  const sharedBuildParams = { ...params, configuration };
-
-  const platformOptions = {
-    platform: detectedPlatform,
-    simulatorName: params.simulatorName,
-    simulatorId: params.simulatorId,
-    useLatestOS: params.simulatorId ? false : useLatestOS,
-    logPrefix,
-  };
-
-  const preflightText = formatToolPreflight({
-    operation: 'Build',
-    scheme: params.scheme,
-    workspacePath: params.workspacePath,
-    projectPath: params.projectPath,
+  return {
     configuration,
-    platform: String(detectedPlatform),
-    simulatorName: params.simulatorName,
-    simulatorId: params.simulatorId,
-  });
-
-  const pipelineParams = {
-    scheme: params.scheme,
-    workspacePath: params.workspacePath,
-    projectPath: params.projectPath,
-    configuration,
-    platform: String(detectedPlatform),
-    simulatorName: params.simulatorName,
-    simulatorId: params.simulatorId,
-    preflight: preflightText,
+    detectedPlatform,
+    platformName,
+    sharedBuildParams: { ...params, configuration },
+    platformOptions: {
+      platform: detectedPlatform,
+      simulatorName: params.simulatorName,
+      simulatorId: params.simulatorId,
+      useLatestOS: params.simulatorId ? false : useLatestOS,
+      logPrefix: `${platformName} Simulator Build`,
+    },
+    invocationRequest: {
+      scheme: params.scheme,
+      workspacePath: params.workspacePath,
+      projectPath: params.projectPath,
+      configuration,
+      platform: detectedPlatform,
+      simulatorName: params.simulatorName,
+      simulatorId: params.simulatorId,
+    },
+    warningMessage:
+      params.simulatorId && params.useLatestOS !== undefined
+        ? 'useLatestOS parameter is ignored when using simulatorId (UUID implies exact device/OS)'
+        : undefined,
   };
-
-  const started = startBuildPipeline({
-    operation: 'BUILD',
-    toolName: 'build_sim',
-    params: pipelineParams,
-    message: preflightText,
-  });
-
-  const buildResult = await executeXcodeBuildCommand(
-    sharedBuildParams,
-    platformOptions,
-    params.preferXcodebuild ?? false,
-    'build',
-    executor,
-    undefined,
-    started.pipeline,
-  );
-
-  finalizeInlineXcodebuild({
-    started,
-    emit: ctx.emit,
-    succeeded: !buildResult.isError,
-    durationMs: Date.now() - started.startedAt,
-    responseContent: buildResult.content,
-  });
-
-  if (!buildResult.isError) {
-    ctx.nextStepParams = {
-      get_sim_app_path: {
-        ...(params.simulatorId
-          ? { simulatorId: params.simulatorId }
-          : { simulatorName: params.simulatorName ?? '' }),
-        scheme: params.scheme,
-        platform: String(detectedPlatform),
-      },
-    };
-  }
 }
 
 const publicSchemaObject = baseSchemaObject.omit({
@@ -193,13 +154,80 @@ const publicSchemaObject = baseSchemaObject.omit({
   preferXcodebuild: true,
 } as const);
 
+export function createBuildSimExecutor(
+  executor: CommandExecutor,
+  prepared?: PreparedBuildSimExecution,
+): StreamingExecutor<BuildSimulatorParams, BuildSimulatorResult> {
+  return async (params, ctx) => {
+    const resolved = prepared ?? (await prepareBuildSimExecution(params, executor));
+
+    if (resolved.warningMessage) {
+      log('warn', resolved.warningMessage);
+      ctx.emitFragment({
+        kind: 'build-result',
+        fragment: 'warning',
+        message: resolved.warningMessage,
+      });
+    }
+
+    const started = createDomainStreamingPipeline('build_sim', 'BUILD', ctx, 'build-result');
+    const buildResult = await executeXcodeBuildCommand(
+      resolved.sharedBuildParams,
+      resolved.platformOptions,
+      params.preferXcodebuild ?? false,
+      'build',
+      executor,
+      undefined,
+      started.pipeline,
+    );
+
+    return createBuildDomainResult({
+      started,
+      succeeded: !buildResult.isError,
+      target: 'simulator',
+      artifacts: {
+        buildLogPath: started.pipeline.logPath,
+      },
+      fallbackErrorMessages: collectFallbackErrorMessages(started, [], buildResult.content),
+      request: resolved.invocationRequest,
+    });
+  };
+}
+
+export async function build_simLogic(
+  params: BuildSimulatorParams,
+  executor: CommandExecutor,
+): Promise<void> {
+  const ctx = getHandlerContext();
+  const prepared = await prepareBuildSimExecution(params, executor);
+
+  ctx.emit(createBuildInvocationFragment('build-result', 'BUILD', prepared.invocationRequest));
+  const executionContext = createStreamingExecutionContext(ctx);
+  const executeBuildSim = createBuildSimExecutor(executor, prepared);
+  const result = await executeBuildSim(params, executionContext);
+
+  setXcodebuildStructuredOutput(ctx, 'build-result', result);
+
+  if (!result.didError) {
+    ctx.nextStepParams = {
+      get_sim_app_path: {
+        ...(params.simulatorId
+          ? { simulatorId: params.simulatorId }
+          : { simulatorName: params.simulatorName ?? '' }),
+        scheme: params.scheme,
+        platform: prepared.detectedPlatform,
+      },
+    };
+  }
+}
+
 export const schema = getSessionAwareToolSchemaShape({
   sessionAware: publicSchemaObject,
   legacy: baseSchemaObject,
 });
 
 export const handler = createSessionAwareTool<BuildSimulatorParams>({
-  internalSchema: buildSimulatorSchema as unknown as z.ZodType<BuildSimulatorParams, unknown>,
+  internalSchema: toInternalSchema<BuildSimulatorParams>(buildSimulatorSchema),
   logicFunction: build_simLogic,
   getExecutor: getDefaultCommandExecutor,
   requirements: [

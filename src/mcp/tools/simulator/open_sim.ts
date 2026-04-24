@@ -1,14 +1,75 @@
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { SimulatorActionResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
 import { createTypedTool, getHandlerContext } from '../../../utils/typed-tool-factory.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
 
 const openSimSchema = z.object({});
 
 type OpenSimParams = z.infer<typeof openSimSchema>;
+type OpenSimResult = SimulatorActionResultDomainResult;
+
+function createOpenSimResult(params: {
+  didError: boolean;
+  error?: string;
+  diagnosticMessage?: string;
+}): OpenSimResult {
+  return {
+    kind: 'simulator-action-result',
+    didError: params.didError,
+    error: params.error ?? null,
+    summary: {
+      status: params.didError ? 'FAILED' : 'SUCCEEDED',
+    },
+    action: {
+      type: 'open',
+    },
+    ...(params.diagnosticMessage
+      ? { diagnostics: createBasicDiagnostics({ errors: [params.diagnosticMessage] }) }
+      : {}),
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: OpenSimResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.simulator-action-result',
+    schemaVersion: '1',
+  };
+}
+
+export function createOpenSimExecutor(
+  executor: CommandExecutor,
+): NonStreamingExecutor<OpenSimParams, OpenSimResult> {
+  return async (_params) => {
+    try {
+      const result = await executor(['open', '-a', 'Simulator'], 'Open Simulator', false);
+
+      if (!result.success) {
+        const diagnosticMessage = result.error ?? 'Unknown error';
+        return createOpenSimResult({
+          didError: true,
+          error: 'Open simulator operation failed.',
+          diagnosticMessage,
+        });
+      }
+
+      return createOpenSimResult({ didError: false });
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createOpenSimResult({
+        didError: true,
+        error: 'Open simulator operation failed.',
+        diagnosticMessage,
+      });
+    }
+  };
+}
 
 export async function open_simLogic(
   _params: OpenSimParams,
@@ -16,34 +77,19 @@ export async function open_simLogic(
 ): Promise<void> {
   log('info', 'Starting open simulator request');
 
-  const headerEvent = header('Open Simulator');
-
   const ctx = getHandlerContext();
+  const executeOpenSim = createOpenSimExecutor(executor);
+  const result = await executeOpenSim(_params);
+  setStructuredOutput(ctx, result);
 
-  return withErrorHandling(
-    ctx,
-    async () => {
-      const command = ['open', '-a', 'Simulator'];
-      const result = await executor(command, 'Open Simulator', false);
+  if (result.didError) {
+    log('error', `Error during open simulator operation: ${result.error ?? 'Unknown error'}`);
+    return;
+  }
 
-      if (!result.success) {
-        ctx.emit(headerEvent);
-        ctx.emit(statusLine('error', `Open simulator operation failed: ${result.error}`));
-        return;
-      }
-
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('success', 'Simulator opened successfully'));
-      ctx.nextStepParams = {
-        boot_sim: { simulatorId: 'UUID_FROM_LIST_SIMS' },
-      };
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Open simulator operation failed: ${message}`,
-      logMessage: ({ message }) => `Error during open simulator operation: ${message}`,
-    },
-  );
+  ctx.nextStepParams = {
+    boot_sim: { simulatorId: 'UUID_FROM_LIST_SIMS' },
+  };
 }
 
 export const schema = openSimSchema.shape;

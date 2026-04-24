@@ -1,41 +1,85 @@
-import type { PipelineEvent } from '../types/pipeline-events.ts';
+import type { AnyFragment } from '../types/domain-fragments.ts';
+import type { NextStep } from '../types/common.ts';
 import { sessionStore } from '../utils/session-store.ts';
 import {
   createCliTextRenderer,
   renderCliTextTranscript,
 } from '../utils/renderers/cli-text-renderer.ts';
-import type { RenderSession, RenderStrategy, ImageAttachment } from './types.ts';
+import type {
+  RenderSession,
+  RenderStrategy,
+  ImageAttachment,
+  StructuredToolOutput,
+} from './types.ts';
 
-function isErrorEvent(event: PipelineEvent): boolean {
+function isErrorFragment(fragment: AnyFragment): boolean {
   return (
-    (event.type === 'status-line' && event.level === 'error') ||
-    (event.type === 'summary' && event.status === 'FAILED')
+    (fragment.fragment === 'compiler-diagnostic' && fragment.severity === 'error') ||
+    (fragment.fragment === 'status' && fragment.level === 'error')
   );
 }
 
+export interface RenderTranscriptInput {
+  items?: readonly AnyFragment[];
+  structuredOutput?: StructuredToolOutput;
+  nextSteps?: readonly NextStep[];
+  nextStepsRuntime?: 'cli' | 'daemon' | 'mcp';
+}
+
 interface RenderSessionHooks {
-  onEmit?: (event: PipelineEvent) => void;
-  finalize: (events: readonly PipelineEvent[]) => string;
+  onEmit?: (fragment: AnyFragment) => void;
+  onSetStructuredOutput?: (output: StructuredToolOutput) => void;
+  onSetNextSteps?: (steps: readonly NextStep[], runtime: 'cli' | 'daemon' | 'mcp') => void;
+  finalize: (input: RenderTranscriptInput) => string;
 }
 
 function createBaseRenderSession(hooks: RenderSessionHooks): RenderSession {
-  const events: PipelineEvent[] = [];
+  const fragments: AnyFragment[] = [];
   const attachments: ImageAttachment[] = [];
+  let structuredOutput: StructuredToolOutput | undefined;
+  let nextSteps: NextStep[] = [];
+  let nextStepsRuntime: 'cli' | 'daemon' | 'mcp' | undefined;
   let hasError = false;
 
   return {
-    emit(event: PipelineEvent): void {
-      events.push(event);
-      if (isErrorEvent(event)) hasError = true;
-      hooks.onEmit?.(event);
+    emit(fragment: AnyFragment): void {
+      fragments.push(fragment);
+      if (isErrorFragment(fragment)) hasError = true;
+      hooks.onEmit?.(fragment);
     },
 
     attach(image: ImageAttachment): void {
       attachments.push(image);
     },
 
-    getEvents(): readonly PipelineEvent[] {
-      return events;
+    setStructuredOutput(output: StructuredToolOutput): void {
+      structuredOutput = output;
+      if (output.result.didError) {
+        hasError = true;
+      }
+      hooks.onSetStructuredOutput?.(output);
+    },
+
+    getStructuredOutput(): StructuredToolOutput | undefined {
+      return structuredOutput;
+    },
+
+    setNextSteps(steps: NextStep[], runtime: 'cli' | 'daemon' | 'mcp'): void {
+      nextSteps = [...steps];
+      nextStepsRuntime = runtime;
+      hooks.onSetNextSteps?.(steps, runtime);
+    },
+
+    getNextSteps(): readonly NextStep[] {
+      return nextSteps;
+    },
+
+    getNextStepsRuntime(): 'cli' | 'daemon' | 'mcp' | undefined {
+      return nextStepsRuntime;
+    },
+
+    getFragments(): readonly AnyFragment[] {
+      return fragments;
     },
 
     getAttachments(): readonly ImageAttachment[] {
@@ -47,7 +91,12 @@ function createBaseRenderSession(hooks: RenderSessionHooks): RenderSession {
     },
 
     finalize(): string {
-      return hooks.finalize(events);
+      return hooks.finalize({
+        items: fragments,
+        structuredOutput,
+        nextSteps,
+        nextStepsRuntime,
+      });
     },
   };
 }
@@ -56,10 +105,43 @@ function createTextRenderSession(): RenderSession {
   const suppressWarnings = sessionStore.get('suppressWarnings');
 
   return createBaseRenderSession({
-    finalize: (events) =>
-      renderCliTextTranscript(events, {
+    finalize: (input) =>
+      renderCliTextTranscript({
+        ...input,
         suppressWarnings: suppressWarnings ?? false,
       }),
+  });
+}
+
+function createRawRenderSession(): RenderSession {
+  const suppressWarnings = sessionStore.get('suppressWarnings');
+
+  return createBaseRenderSession({
+    onEmit: (fragment) => {
+      if (fragment.kind === 'transcript') {
+        if (fragment.fragment === 'process-command') {
+          const dim = process.stderr.isTTY ? '\x1B[2m' : '';
+          const reset = process.stderr.isTTY ? '\x1B[0m' : '';
+          process.stderr.write(`${dim}$ ${fragment.displayCommand}${reset}\n`);
+        } else if (fragment.fragment === 'process-line') {
+          process.stderr.write(fragment.line);
+        }
+      }
+    },
+    finalize: (input) => {
+      const nonTranscriptItems = (input.items ?? []).filter((f) => f.kind !== 'transcript');
+      const text = renderCliTextTranscript({
+        items: nonTranscriptItems,
+        structuredOutput: input.structuredOutput,
+        nextSteps: input.nextSteps,
+        nextStepsRuntime: input.nextStepsRuntime,
+        suppressWarnings: suppressWarnings ?? false,
+      });
+      if (text) {
+        process.stdout.write(text);
+      }
+      return '';
+    },
   });
 }
 
@@ -67,18 +149,13 @@ function createCliTextRenderSession(options: { interactive: boolean }): RenderSe
   const renderer = createCliTextRenderer(options);
 
   return createBaseRenderSession({
-    onEmit: (event) => renderer.onEvent(event),
+    onEmit: (fragment) => renderer.onFragment(fragment),
+    onSetStructuredOutput: (output) => renderer.setStructuredOutput(output),
+    onSetNextSteps: (steps, runtime) => renderer.setNextSteps(steps, runtime),
     finalize: () => {
       renderer.finalize();
       return '';
     },
-  });
-}
-
-function createCliJsonRenderSession(): RenderSession {
-  return createBaseRenderSession({
-    onEmit: (event) => process.stdout.write(JSON.stringify(event) + '\n'),
-    finalize: () => '',
   });
 }
 
@@ -95,15 +172,28 @@ export function createRenderSession(
       return createTextRenderSession();
     case 'cli-text':
       return createCliTextRenderSession({ interactive: options?.interactive ?? false });
-    case 'cli-json':
-      return createCliJsonRenderSession();
+    case 'raw':
+      return createRawRenderSession();
   }
 }
 
-export function renderEvents(events: readonly PipelineEvent[], strategy: RenderStrategy): string {
+export function renderTranscript(input: RenderTranscriptInput, strategy: RenderStrategy): string {
   const session = createRenderSession(strategy);
-  for (const event of events) {
-    session.emit(event);
+  for (const item of input.items ?? []) {
+    session.emit(item);
+  }
+  if (input.structuredOutput) {
+    session.setStructuredOutput?.(input.structuredOutput);
+  }
+  if (input.nextSteps && input.nextSteps.length > 0) {
+    session.setNextSteps?.([...input.nextSteps], input.nextStepsRuntime ?? 'cli');
   }
   return session.finalize();
+}
+
+export function renderFragments(
+  fragments: readonly AnyFragment[],
+  strategy: RenderStrategy,
+): string {
+  return renderTranscript({ items: fragments }, strategy);
 }

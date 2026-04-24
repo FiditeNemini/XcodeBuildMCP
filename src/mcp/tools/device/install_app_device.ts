@@ -6,6 +6,8 @@
  */
 
 import * as z from 'zod';
+import type { InstallResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
@@ -13,11 +15,15 @@ import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
-import { formatDeviceId } from '../../../utils/device-name-resolver.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import { installAppOnDevice } from '../../../utils/device-steps.ts';
+import {
+  buildInstallFailure,
+  buildInstallSuccess,
+  setInstallResultStructuredOutput,
+} from '../../../utils/app-lifecycle-results.ts';
 
 const installAppDeviceSchema = z.object({
   deviceId: z
@@ -35,36 +41,39 @@ export async function install_app_deviceLogic(
   params: InstallAppDeviceParams,
   executor: CommandExecutor,
 ): Promise<void> {
-  const { deviceId, appPath } = params;
-  const headerEvent = header('Install App', [
-    { label: 'Device', value: formatDeviceId(deviceId) },
-    { label: 'App', value: appPath },
-  ]);
-
-  log('info', `Installing app on device ${deviceId}`);
-
   const ctx = getHandlerContext();
+  const executeInstallAppDevice = createInstallAppDeviceExecutor(executor);
+  const result = await executeInstallAppDevice(params);
 
-  return withErrorHandling(
-    ctx,
-    async () => {
-      const installResult = await installAppOnDevice(deviceId, appPath, executor);
+  setInstallResultStructuredOutput(ctx, result);
+
+  if (result.didError) {
+    log('error', `Error installing app on device: ${result.error ?? 'Unknown error'}`);
+  }
+}
+
+export function createInstallAppDeviceExecutor(
+  executor: CommandExecutor,
+): NonStreamingExecutor<InstallAppDeviceParams, InstallResultDomainResult> {
+  return async (params) => {
+    const artifacts = { deviceId: params.deviceId, appPath: params.appPath };
+    log('info', `Installing app on device ${params.deviceId}`);
+
+    try {
+      const installResult = await installAppOnDevice(params.deviceId, params.appPath, executor);
 
       if (!installResult.success) {
-        ctx.emit(headerEvent);
-        ctx.emit(statusLine('error', `Failed to install app: ${installResult.error}`));
-        return;
+        return buildInstallFailure(artifacts, `Failed to install app: ${installResult.error}`);
       }
 
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('success', 'App installed successfully.'));
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to install app on device: ${message}`,
-      logMessage: ({ message }) => `Error installing app on device: ${message}`,
-    },
-  );
+      return buildInstallSuccess(artifacts);
+    } catch (error) {
+      return buildInstallFailure(
+        artifacts,
+        `Failed to install app on device: ${toErrorMessage(error)}`,
+      );
+    }
+  };
 }
 
 export const schema = getSessionAwareToolSchemaShape({
@@ -73,7 +82,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<InstallAppDeviceParams>({
-  internalSchema: installAppDeviceSchema as unknown as z.ZodType<InstallAppDeviceParams, unknown>,
+  internalSchema: toInternalSchema<InstallAppDeviceParams>(installAppDeviceSchema),
   logicFunction: install_app_deviceLogic,
   getExecutor: getDefaultCommandExecutor,
   requirements: [{ allOf: ['deviceId'], message: 'deviceId is required' }],

@@ -1,6 +1,9 @@
 import * as z from 'zod';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { DebugSessionActionDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import {
   createTypedToolWithContext,
   getHandlerContext,
@@ -15,31 +18,78 @@ const debugContinueSchema = z.object({
 });
 
 export type DebugContinueParams = z.infer<typeof debugContinueSchema>;
+type DebugContinueResult = DebugSessionActionDomainResult;
+
+function createDebugContinueResult(params: {
+  didError: boolean;
+  error?: string;
+  diagnosticMessage?: string;
+  debugSessionId?: string;
+}): DebugContinueResult {
+  return {
+    kind: 'debug-session-action',
+    didError: params.didError,
+    error: params.error ?? null,
+    ...(params.didError
+      ? {
+          diagnostics: createBasicDiagnostics({
+            errors: [params.diagnosticMessage ?? params.error ?? 'Unknown error'],
+          }),
+        }
+      : {}),
+    action: 'continue',
+    ...(params.debugSessionId
+      ? {
+          session: {
+            debugSessionId: params.debugSessionId,
+            connectionState: 'attached',
+            executionState: 'running',
+          },
+        }
+      : {}),
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: DebugContinueResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.debug-session-action',
+    schemaVersion: '1',
+  };
+}
+
+export function createDebugContinueExecutor(
+  debuggerManager: DebuggerToolContext['debugger'],
+): NonStreamingExecutor<DebugContinueParams, DebugContinueResult> {
+  return async (params) => {
+    const targetId = params.debugSessionId ?? debuggerManager.getCurrentSessionId() ?? undefined;
+
+    try {
+      await debuggerManager.resumeSession(targetId);
+      return createDebugContinueResult({
+        didError: false,
+        debugSessionId: targetId ?? debuggerManager.getCurrentSessionId() ?? undefined,
+      });
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createDebugContinueResult({
+        didError: true,
+        error: 'Failed to resume debugger.',
+        diagnosticMessage,
+      });
+    }
+  };
+}
 
 export async function debug_continueLogic(
   params: DebugContinueParams,
   ctx: DebuggerToolContext,
 ): Promise<void> {
-  const headerEvent = header('Continue');
-
   const handlerCtx = getHandlerContext();
+  const executeDebugContinue = createDebugContinueExecutor(ctx.debugger);
+  const result = await executeDebugContinue(params);
 
-  return withErrorHandling(
-    handlerCtx,
-    async () => {
-      const targetId = params.debugSessionId ?? ctx.debugger.getCurrentSessionId();
-      await ctx.debugger.resumeSession(targetId ?? undefined);
-
-      handlerCtx.emit(headerEvent);
-      handlerCtx.emit(
-        statusLine('success', `Resumed debugger session${targetId ? ` ${targetId}` : ''}`),
-      );
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to resume debugger: ${message}`,
-    },
-  );
+  setStructuredOutput(handlerCtx, result);
 }
 
 export const schema = debugContinueSchema.shape;

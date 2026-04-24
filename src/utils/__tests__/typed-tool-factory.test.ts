@@ -10,7 +10,9 @@ import { createMockExecutor } from '../../test-utils/mock-executors.ts';
 import { createRenderSession } from '../../rendering/render.ts';
 import type { ToolHandlerContext } from '../../rendering/types.ts';
 import { getHandlerContext } from '../typed-tool-factory.ts';
-import { statusLine } from '../tool-event-builders.ts';
+import type { AnyFragment } from '../../types/domain-fragments.ts';
+import type { RuntimeStatusFragment } from '../../types/runtime-status.ts';
+import { renderCliTextTranscript } from '../renderers/cli-text-renderer.ts';
 
 const testSchema = z.object({
   requiredParam: z.string().describe('A required string parameter'),
@@ -19,9 +21,16 @@ const testSchema = z.object({
 
 type TestParams = z.infer<typeof testSchema>;
 
+function statusFragment(
+  level: 'info' | 'warning' | 'error' | 'success',
+  message: string,
+): RuntimeStatusFragment {
+  return { kind: 'infrastructure', fragment: 'status', level, message };
+}
+
 async function testLogic(params: TestParams): Promise<void> {
   const ctx = getHandlerContext();
-  ctx.emit(statusLine('success', `Logic executed with: ${params.requiredParam}`));
+  ctx.emit(statusFragment('success', `Logic executed with: ${params.requiredParam}`));
 }
 
 function invokeAndCollect(
@@ -29,12 +38,18 @@ function invokeAndCollect(
   args: Record<string, unknown>,
 ): Promise<{ text: string; isError: boolean }> {
   const session = createRenderSession('text');
+  const items: AnyFragment[] = [];
   const ctx: ToolHandlerContext = {
-    emit: (event) => session.emit(event),
+    liveProgressEnabled: false,
+    streamingFragmentsEnabled: false,
+    emit: (event) => {
+      items.push(event);
+      session.emit(event);
+    },
     attach: (image) => session.attach(image),
   };
   return handler(args, ctx).then(() => ({
-    text: session.finalize(),
+    text: renderCliTextTranscript({ items }),
     isError: session.isError(),
   }));
 }
@@ -132,7 +147,7 @@ describe('createTypedTool', () => {
       async function executorTestLogic(_params: TestParams, executor: unknown): Promise<void> {
         expect(executor).toBe(mockExecutor);
         const ctx = getHandlerContext();
-        ctx.emit(statusLine('success', 'Executor passed correctly'));
+        ctx.emit(statusFragment('success', 'Executor passed correctly'));
       }
 
       const handler = createTypedTool(testSchema, executorTestLogic, () => mockExecutor);

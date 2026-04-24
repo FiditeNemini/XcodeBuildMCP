@@ -1,1 +1,1 @@
-export { handleTestLogic } from '../test-common.ts';
+export { createTestExecutor } from '../test-common.ts';

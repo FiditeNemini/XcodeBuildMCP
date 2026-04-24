@@ -1,10 +1,14 @@
 import * as z from 'zod';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { DebugCommandResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
 import {
   createTypedToolWithContext,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
 import {
   getDefaultDebuggerToolContext,
@@ -20,40 +24,85 @@ const baseSchemaObject = z.object({
 const debugLldbCommandSchema = z.preprocess(nullifyEmptyStrings, baseSchemaObject);
 
 export type DebugLldbCommandParams = z.infer<typeof debugLldbCommandSchema>;
+type DebugLldbCommandResult = DebugCommandResultDomainResult;
+
+function createDebugCommandResult(params: {
+  command: string;
+  didError: boolean;
+  error?: string;
+  diagnosticMessage?: string;
+  outputLines?: string[];
+}): DebugLldbCommandResult {
+  return {
+    kind: 'debug-command-result',
+    didError: params.didError,
+    error: params.error ?? null,
+    ...(params.didError
+      ? {
+          diagnostics: createBasicDiagnostics({
+            errors: [params.diagnosticMessage ?? params.error ?? 'Unknown error'],
+          }),
+        }
+      : {}),
+    command: params.command,
+    outputLines: params.outputLines ?? [],
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: DebugLldbCommandResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.debug-command-result',
+    schemaVersion: '1',
+  };
+}
+
+function splitOutputLines(output: string): string[] {
+  const trimmed = output.trim();
+  return trimmed.length > 0 ? trimmed.split('\n') : [];
+}
+
+export function createDebugLldbCommandExecutor(
+  debuggerManager: DebuggerToolContext['debugger'],
+): NonStreamingExecutor<DebugLldbCommandParams, DebugLldbCommandResult> {
+  return async (params) => {
+    try {
+      const output = await debuggerManager.runCommand(params.debugSessionId, params.command, {
+        timeoutMs: params.timeoutMs,
+      });
+
+      return createDebugCommandResult({
+        command: params.command,
+        didError: false,
+        outputLines: splitOutputLines(output),
+      });
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createDebugCommandResult({
+        command: params.command,
+        didError: true,
+        error: 'Failed to run LLDB command.',
+        diagnosticMessage,
+      });
+    }
+  };
+}
 
 export async function debug_lldb_commandLogic(
   params: DebugLldbCommandParams,
   ctx: DebuggerToolContext,
 ): Promise<void> {
-  const headerEvent = header('LLDB Command', [{ label: 'Command', value: params.command }]);
-
   const handlerCtx = getHandlerContext();
+  const executeDebugLldbCommand = createDebugLldbCommandExecutor(ctx.debugger);
+  const result = await executeDebugLldbCommand(params);
 
-  return withErrorHandling(
-    handlerCtx,
-    async () => {
-      const output = await ctx.debugger.runCommand(params.debugSessionId, params.command, {
-        timeoutMs: params.timeoutMs,
-      });
-      const trimmed = output.trim();
-
-      handlerCtx.emit(headerEvent);
-      handlerCtx.emit(statusLine('success', 'Command executed'));
-      if (trimmed) {
-        handlerCtx.emit(section('Output:', trimmed.split('\n')));
-      }
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to run LLDB command: ${message}`,
-    },
-  );
+  setStructuredOutput(handlerCtx, result);
 }
 
 export const schema = baseSchemaObject.shape;
 
 export const handler = createTypedToolWithContext<DebugLldbCommandParams, DebuggerToolContext>(
-  debugLldbCommandSchema as unknown as z.ZodType<DebugLldbCommandParams, unknown>,
+  toInternalSchema<DebugLldbCommandParams>(debugLldbCommandSchema),
   debug_lldb_commandLogic,
   getDefaultDebuggerToolContext,
 );

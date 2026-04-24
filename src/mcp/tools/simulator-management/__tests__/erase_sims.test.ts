@@ -21,16 +21,20 @@ describe('erase_sims tool (single simulator)', () => {
       const mock = createMockExecutor({ success: false, error: 'Booted device' });
       const res = await runLogic(() => erase_simsLogic({ simulatorId: 'UD1' }, mock));
       expect(res.isError).toBe(true);
+      const text = allText(res);
+      expect(text).toContain('Failed to erase simulator.');
+      expect(text).toContain('Booted device');
     });
 
-    it('adds tool hint when booted error occurs without shutdownFirst', async () => {
+    it('returns an error when the simulator is booted and shutdownFirst is not enabled', async () => {
       const bootedError =
         'An error was encountered processing the command (domain=com.apple.CoreSimulator.SimError, code=405):\nUnable to erase contents and settings in current state: Booted\n';
       const mock = createMockExecutor({ success: false, error: bootedError });
       const res = await runLogic(() => erase_simsLogic({ simulatorId: 'UD1' }, mock));
-      const text = allText(res);
-      expect(text).toContain('shutdownFirst: true');
       expect(res.isError).toBe(true);
+      const text = allText(res);
+      expect(text).toContain('Failed to erase simulator.');
+      expect(text).toContain('Unable to erase contents and settings in current state: Booted');
     });
 
     it('performs shutdown first when shutdownFirst=true', async () => {

@@ -6,8 +6,10 @@
  */
 
 import * as z from 'zod';
+import type { TestResultDomainResult } from '../../../types/domain-results.ts';
+import type { StreamingExecutor } from '../../../types/tool-execution.ts';
 import { XcodePlatform } from '../../../types/common.ts';
-import { handleTestLogic } from '../../../utils/test/index.ts';
+import { createTestExecutor } from '../../../utils/test/index.ts';
 import type { CommandExecutor, FileSystemExecutor } from '../../../utils/execution/index.ts';
 import {
   getDefaultCommandExecutor,
@@ -16,9 +18,17 @@ import {
 import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
-import { resolveTestPreflight } from '../../../utils/test-preflight.ts';
+import { nullifyEmptyStrings, withProjectOrWorkspace } from '../../../utils/schema-helpers.ts';
+import { resolveTestPreflight, type TestPreflightResult } from '../../../utils/test-preflight.ts';
+import { getHandlerContext } from '../../../utils/typed-tool-factory.ts';
+import {
+  createStreamingExecutionContext,
+  setXcodebuildStructuredOutput,
+} from '../../../utils/xcodebuild-domain-results.ts';
+import type { BuildInvocationRequest } from '../../../types/domain-fragments.ts';
+import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
 
 const baseSchemaObject = z.object({
   projectPath: z.string().optional().describe('Path to the .xcodeproj file'),
@@ -49,26 +59,22 @@ const publicSchemaObject = baseSchemaObject.omit({
   preferXcodebuild: true,
 } as const);
 
-const testMacosSchema = z.preprocess(
-  nullifyEmptyStrings,
-  baseSchemaObject
-    .refine((val) => val.projectPath !== undefined || val.workspacePath !== undefined, {
-      message: 'Either projectPath or workspacePath is required.',
-    })
-    .refine((val) => !(val.projectPath !== undefined && val.workspacePath !== undefined), {
-      message: 'projectPath and workspacePath are mutually exclusive. Provide only one.',
-    }),
-);
+const testMacosSchema = z.preprocess(nullifyEmptyStrings, withProjectOrWorkspace(baseSchemaObject));
 
 export type TestMacosParams = z.infer<typeof testMacosSchema>;
+type TestMacosResult = TestResultDomainResult;
 
-export async function testMacosLogic(
+interface PreparedTestMacosExecution {
+  configuration: string;
+  preflight?: TestPreflightResult;
+  invocationRequest: BuildInvocationRequest;
+}
+
+async function prepareTestMacosExecution(
   params: TestMacosParams,
-  executor: CommandExecutor = getDefaultCommandExecutor(),
-  fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
-): Promise<void> {
+  fileSystemExecutor: FileSystemExecutor,
+): Promise<PreparedTestMacosExecution> {
   const configuration = params.configuration ?? 'Debug';
-
   const preflight = await resolveTestPreflight(
     {
       projectPath: params.projectPath,
@@ -81,25 +87,65 @@ export async function testMacosLogic(
     fileSystemExecutor,
   );
 
-  await handleTestLogic(
-    {
-      projectPath: params.projectPath,
-      workspacePath: params.workspacePath,
+  return {
+    configuration,
+    preflight: preflight ?? undefined,
+    invocationRequest: {
       scheme: params.scheme,
       configuration,
-      derivedDataPath: params.derivedDataPath,
-      extraArgs: params.extraArgs,
-      preferXcodebuild: params.preferXcodebuild ?? false,
-      platform: XcodePlatform.macOS,
-      testRunnerEnv: params.testRunnerEnv,
-      progress: params.progress,
+      platform: 'macOS',
+      onlyTesting: preflight?.selectors.onlyTesting.map((selector) => selector.raw),
+      skipTesting: preflight?.selectors.skipTesting.map((selector) => selector.raw),
     },
-    executor,
-    {
-      preflight: preflight ?? undefined,
+  };
+}
+
+export function createTestMacOSExecutor(
+  executor: CommandExecutor = getDefaultCommandExecutor(),
+  fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
+  prepared?: PreparedTestMacosExecution,
+): StreamingExecutor<TestMacosParams, TestMacosResult> {
+  return async (params, ctx) => {
+    const resolved = prepared ?? (await prepareTestMacosExecution(params, fileSystemExecutor));
+    const executeTest = createTestExecutor(executor, {
+      preflight: resolved.preflight,
       toolName: 'test_macos',
-    },
-  );
+      target: 'macos',
+      request: resolved.invocationRequest,
+    });
+
+    return executeTest(
+      {
+        projectPath: params.projectPath,
+        workspacePath: params.workspacePath,
+        scheme: params.scheme,
+        configuration: resolved.configuration,
+        derivedDataPath: params.derivedDataPath,
+        extraArgs: params.extraArgs,
+        preferXcodebuild: params.preferXcodebuild ?? false,
+        platform: XcodePlatform.macOS,
+        testRunnerEnv: params.testRunnerEnv,
+        progress: params.progress,
+      },
+      ctx,
+    );
+  };
+}
+
+export async function testMacosLogic(
+  params: TestMacosParams,
+  executor: CommandExecutor = getDefaultCommandExecutor(),
+  fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
+): Promise<void> {
+  const ctx = getHandlerContext();
+  const prepared = await prepareTestMacosExecution(params, fileSystemExecutor);
+
+  ctx.emit(createBuildInvocationFragment('test-result', 'TEST', prepared.invocationRequest));
+  const executionContext = createStreamingExecutionContext(ctx);
+  const executeTestMacOS = createTestMacOSExecutor(executor, fileSystemExecutor, prepared);
+  const result = await executeTestMacOS(params, executionContext);
+
+  setXcodebuildStructuredOutput(ctx, 'test-result', result);
 }
 
 export const schema = getSessionAwareToolSchemaShape({
@@ -108,7 +154,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<TestMacosParams>({
-  internalSchema: testMacosSchema as unknown as z.ZodType<TestMacosParams, unknown>,
+  internalSchema: toInternalSchema<TestMacosParams>(testMacosSchema),
   logicFunction: (params, executor) =>
     testMacosLogic(params, executor, getDefaultFileSystemExecutor()),
   getExecutor: getDefaultCommandExecutor,

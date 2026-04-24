@@ -1,6 +1,9 @@
 import * as z from 'zod';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { DebugBreakpointResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import {
   createTypedToolWithContext,
   getHandlerContext,
@@ -16,35 +19,71 @@ const debugBreakpointRemoveSchema = z.object({
 });
 
 export type DebugBreakpointRemoveParams = z.infer<typeof debugBreakpointRemoveSchema>;
+type DebugBreakpointRemoveResult = DebugBreakpointResultDomainResult;
+
+function createDebugBreakpointRemoveResult(params: {
+  didError: boolean;
+  error?: string;
+  diagnosticMessage?: string;
+  breakpointId: number;
+}): DebugBreakpointRemoveResult {
+  return {
+    kind: 'debug-breakpoint-result',
+    didError: params.didError,
+    error: params.error ?? null,
+    ...(params.didError
+      ? {
+          diagnostics: createBasicDiagnostics({
+            errors: [params.diagnosticMessage ?? params.error ?? 'Unknown error'],
+          }),
+        }
+      : {}),
+    action: 'remove',
+    breakpoint: {
+      breakpointId: params.breakpointId,
+    },
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: DebugBreakpointRemoveResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.debug-breakpoint-result',
+    schemaVersion: '1',
+  };
+}
+
+export function createDebugBreakpointRemoveExecutor(
+  debuggerManager: DebuggerToolContext['debugger'],
+): NonStreamingExecutor<DebugBreakpointRemoveParams, DebugBreakpointRemoveResult> {
+  return async (params) => {
+    try {
+      await debuggerManager.removeBreakpoint(params.debugSessionId, params.breakpointId);
+      return createDebugBreakpointRemoveResult({
+        didError: false,
+        breakpointId: params.breakpointId,
+      });
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createDebugBreakpointRemoveResult({
+        didError: true,
+        error: 'Failed to remove breakpoint.',
+        diagnosticMessage,
+        breakpointId: params.breakpointId,
+      });
+    }
+  };
+}
 
 export async function debug_breakpoint_removeLogic(
   params: DebugBreakpointRemoveParams,
   ctx: DebuggerToolContext,
 ): Promise<void> {
-  const headerEvent = header('Remove Breakpoint');
-
   const handlerCtx = getHandlerContext();
+  const executeDebugBreakpointRemove = createDebugBreakpointRemoveExecutor(ctx.debugger);
+  const result = await executeDebugBreakpointRemove(params);
 
-  return withErrorHandling(
-    handlerCtx,
-    async () => {
-      const output = await ctx.debugger.removeBreakpoint(
-        params.debugSessionId,
-        params.breakpointId,
-      );
-      const rawOutput = output.trim();
-
-      handlerCtx.emit(headerEvent);
-      handlerCtx.emit(statusLine('success', `Breakpoint ${params.breakpointId} removed`));
-      if (rawOutput) {
-        handlerCtx.emit(section('Output:', rawOutput.split('\n')));
-      }
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to remove breakpoint: ${message}`,
-    },
-  );
+  setStructuredOutput(handlerCtx, result);
 }
 
 export const schema = debugBreakpointRemoveSchema.shape;

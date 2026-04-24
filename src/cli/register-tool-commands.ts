@@ -8,12 +8,17 @@ import type { OutputFormat } from './output.ts';
 import { groupToolsByWorkflow } from '../runtime/tool-catalog.ts';
 import { getWorkflowMetadataFromManifest } from '../core/manifest/load-manifest.ts';
 import type { ResolvedRuntimeConfig } from '../utils/config-store.ts';
+import type { ToolHandlerContext } from '../rendering/types.ts';
+import type { AnyFragment } from '../types/domain-fragments.ts';
+import { transcriptEmitterStorage } from '../utils/transcript-context.ts';
 import {
   getCliSessionDefaultsForTool,
   isKnownCliSessionDefaultsProfile,
   mergeCliSessionDefaults,
 } from './session-defaults.ts';
 import { createRenderSession } from '../rendering/render.ts';
+import { toStructuredEnvelope } from '../utils/structured-output-envelope.ts';
+import { toCliJsonlEvent } from './jsonl-event.ts';
 
 export interface RegisterToolCommandsOptions {
   workspaceRoot: string;
@@ -64,6 +69,47 @@ function setEnvScoped(key: string, value: string): () => void {
       process.env[key] = previous;
     }
   };
+}
+
+function createBufferedHandlerContext(
+  session: ReturnType<typeof createRenderSession>,
+  opts: { liveProgressEnabled: boolean; onProgress?: (fragment: AnyFragment) => void },
+): ToolHandlerContext {
+  return {
+    liveProgressEnabled: opts.liveProgressEnabled,
+    streamingFragmentsEnabled: opts.liveProgressEnabled,
+    emit: (fragment) => {
+      session.emit(fragment);
+      opts?.onProgress?.(fragment);
+    },
+    attach: (image) => {
+      session.attach(image);
+    },
+  };
+}
+
+const JSON_ERROR_SCHEMA = 'xcodebuildmcp.output.error';
+const JSON_ERROR_SCHEMA_VERSION = '1';
+
+function writeJsonOutput(handlerContext: ToolHandlerContext): boolean {
+  const structuredOutput = handlerContext.structuredOutput;
+
+  const envelope = structuredOutput
+    ? toStructuredEnvelope(
+        structuredOutput.result,
+        structuredOutput.schema,
+        structuredOutput.schemaVersion,
+      )
+    : {
+        schema: JSON_ERROR_SCHEMA,
+        schemaVersion: JSON_ERROR_SCHEMA_VERSION,
+        didError: true,
+        error: 'Tool did not produce structured output for --output json',
+        data: null,
+      };
+
+  process.stdout.write(JSON.stringify(envelope, null, 2) + '\n');
+  return envelope.didError;
 }
 
 /**
@@ -182,7 +228,7 @@ function registerToolSubcommand(
       // Add --output option for format control
       subYargs.option('output', {
         type: 'string',
-        choices: ['text', 'json', 'raw'] as const,
+        choices: ['text', 'json', 'jsonl', 'raw'] as const,
         default: 'text',
         describe: 'Output format',
       });
@@ -222,6 +268,12 @@ function registerToolSubcommand(
       const outputFormat = (argv.output as OutputFormat) ?? 'text';
       const socketPath = argv.socket as string;
       const logLevel = argv['log-level'] as string | undefined;
+
+      if (tool.workflow === 'xcode-ide' && (outputFormat === 'json' || outputFormat === 'jsonl')) {
+        console.error(`Error: --output ${outputFormat} is not supported for xcode-ide tools yet`);
+        process.exitCode = 1;
+        return;
+      }
 
       if (
         profileOverride &&
@@ -290,27 +342,61 @@ function registerToolSubcommand(
       }
 
       const restoreCliOutputFormat = setEnvScoped('XCODEBUILDMCP_CLI_OUTPUT_FORMAT', outputFormat);
-      const restoreVerbose =
-        outputFormat === 'raw' ? setEnvScoped('XCODEBUILDMCP_VERBOSE', '1') : undefined;
 
       try {
         const session =
-          outputFormat === 'json'
-            ? createRenderSession('cli-json')
+          outputFormat === 'text'
+            ? createRenderSession('cli-text', {
+                interactive: process.stdout.isTTY === true,
+              })
             : outputFormat === 'raw'
-              ? createRenderSession('text')
-              : createRenderSession('cli-text', {
-                  interactive: process.stdout.isTTY === true,
-                });
-
-        await invoker.invokeDirect(tool, args, {
-          runtime: 'cli',
-          renderSession: session,
-          cliExposedWorkflowIds,
-          socketPath,
-          workspaceRoot: opts.workspaceRoot,
-          logLevel,
+              ? createRenderSession('raw')
+              : createRenderSession('text');
+        const writeJsonlFragment =
+          outputFormat === 'jsonl'
+            ? (fragment: AnyFragment) => {
+                process.stdout.write(JSON.stringify(toCliJsonlEvent(fragment)) + '\n');
+              }
+            : undefined;
+        const handlerContext = createBufferedHandlerContext(session, {
+          liveProgressEnabled: outputFormat === 'text' || outputFormat === 'jsonl',
+          onProgress: writeJsonlFragment,
         });
+
+        const runInvocation = () =>
+          invoker.invokeDirect(tool, args, {
+            runtime: 'cli',
+            renderSession: session,
+            handlerContext,
+            onProgress: writeJsonlFragment,
+            onStructuredOutput: (structuredOutput) => {
+              handlerContext.structuredOutput = structuredOutput;
+            },
+            cliExposedWorkflowIds,
+            socketPath,
+            workspaceRoot: opts.workspaceRoot,
+            logLevel,
+          });
+
+        if (outputFormat === 'raw') {
+          await transcriptEmitterStorage.run((fragment) => session.emit(fragment), runInvocation);
+        } else {
+          await runInvocation();
+        }
+
+        if (outputFormat === 'json') {
+          if (writeJsonOutput(handlerContext)) {
+            process.exitCode = 1;
+          }
+          return;
+        }
+
+        if (outputFormat === 'jsonl') {
+          if (handlerContext.structuredOutput?.result.didError ?? session.isError()) {
+            process.exitCode = 1;
+          }
+          return;
+        }
 
         session.finalize();
 
@@ -319,7 +405,6 @@ function registerToolSubcommand(
         }
       } finally {
         restoreCliOutputFormat();
-        restoreVerbose?.();
       }
     },
   );

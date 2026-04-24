@@ -1,11 +1,13 @@
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import type { StructuredOutputEnvelope } from '../types/structured-output.ts';
 import { normalizeSnapshotOutput } from './normalize.ts';
 import type { SnapshotResult, WorkflowSnapshotHarness } from './contracts.ts';
 import { resolveSnapshotToolManifest } from './tool-manifest-resolver.ts';
 
 const CLI_PATH = path.resolve(process.cwd(), 'build/cli.js');
+const MCP_TOOL_TIMEOUT_MS = 120_000;
 const MCP_SNAPSHOT_PARITY_WORKFLOWS = [
   'coverage',
   'debugging',
@@ -63,6 +65,19 @@ function extractSnapshotTextContent(result: unknown): string {
   return text;
 }
 
+function extractStructuredEnvelope(result: unknown): StructuredOutputEnvelope<unknown> | null {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+
+  const structuredContent = (result as { structuredContent?: unknown }).structuredContent;
+  if (!structuredContent || typeof structuredContent !== 'object') {
+    return null;
+  }
+
+  return structuredContent as StructuredOutputEnvelope<unknown>;
+}
+
 function createSnapshotHarnessEnv(overrides: Record<string, string>): Record<string, string> {
   const { VITEST: _vitest, NODE_ENV: _nodeEnv, ...rest } = process.env;
   const env = Object.fromEntries(
@@ -92,13 +107,15 @@ export async function createMcpSnapshotHarness(
 
   async function callTool(name: string, args: Record<string, unknown>): Promise<SnapshotResult> {
     const result = await client.callTool({ name, arguments: args }, undefined, {
-      timeout: 120_000,
+      timeout: MCP_TOOL_TIMEOUT_MS,
     });
     const rawText = extractSnapshotTextContent(result);
     const text = normalizeSnapshotOutput(rawText);
-    const isError = (result as { isError?: boolean }).isError ?? false;
+    const structuredEnvelope = extractStructuredEnvelope(result);
+    const isError =
+      structuredEnvelope?.didError ?? (result as { isError?: boolean }).isError ?? false;
 
-    return { text, rawText, isError };
+    return { text, rawText, isError, structuredEnvelope };
   }
 
   async function invoke(

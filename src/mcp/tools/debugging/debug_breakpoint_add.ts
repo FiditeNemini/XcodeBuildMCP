@@ -1,10 +1,14 @@
 import * as z from 'zod';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { DebugBreakpointResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
 import {
   createTypedToolWithContext,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
 import {
   getDefaultDebuggerToolContext,
@@ -35,45 +39,104 @@ const debugBreakpointAddSchema = z.preprocess(
 );
 
 export type DebugBreakpointAddParams = z.infer<typeof debugBreakpointAddSchema>;
+type DebugBreakpointAddResult = DebugBreakpointResultDomainResult;
+
+function createBreakpointSpec(params: DebugBreakpointAddParams): BreakpointSpec {
+  return params.function
+    ? { kind: 'function', name: params.function }
+    : { kind: 'file-line', file: params.file!, line: params.line! };
+}
+
+function createDebugBreakpointAddResult(params: {
+  didError: boolean;
+  error?: string;
+  diagnosticMessage?: string;
+  breakpoint: BreakpointSpec;
+  breakpointId?: number;
+}): DebugBreakpointAddResult {
+  return {
+    kind: 'debug-breakpoint-result',
+    didError: params.didError,
+    error: params.error ?? null,
+    ...(params.didError
+      ? {
+          diagnostics: createBasicDiagnostics({
+            errors: [params.diagnosticMessage ?? params.error ?? 'Unknown error'],
+          }),
+        }
+      : {}),
+    action: 'add',
+    breakpoint:
+      params.breakpoint.kind === 'function'
+        ? {
+            ...(typeof params.breakpointId === 'number'
+              ? { breakpointId: params.breakpointId }
+              : {}),
+            kind: 'function',
+            name: params.breakpoint.name,
+          }
+        : {
+            ...(typeof params.breakpointId === 'number'
+              ? { breakpointId: params.breakpointId }
+              : {}),
+            kind: 'file-line',
+            file: params.breakpoint.file,
+            line: params.breakpoint.line,
+          },
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: DebugBreakpointAddResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.debug-breakpoint-result',
+    schemaVersion: '1',
+  };
+}
+
+export function createDebugBreakpointAddExecutor(
+  debuggerManager: DebuggerToolContext['debugger'],
+): NonStreamingExecutor<DebugBreakpointAddParams, DebugBreakpointAddResult> {
+  return async (params) => {
+    const spec = createBreakpointSpec(params);
+
+    try {
+      const result = await debuggerManager.addBreakpoint(params.debugSessionId, spec, {
+        condition: params.condition,
+      });
+
+      return createDebugBreakpointAddResult({
+        didError: false,
+        breakpoint: spec,
+        breakpointId: result.id,
+      });
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createDebugBreakpointAddResult({
+        didError: true,
+        error: 'Failed to add breakpoint.',
+        diagnosticMessage,
+        breakpoint: spec,
+      });
+    }
+  };
+}
 
 export async function debug_breakpoint_addLogic(
   params: DebugBreakpointAddParams,
   ctx: DebuggerToolContext,
 ): Promise<void> {
-  const headerEvent = header('Add Breakpoint');
-
   const handlerCtx = getHandlerContext();
+  const executeDebugBreakpointAdd = createDebugBreakpointAddExecutor(ctx.debugger);
+  const result = await executeDebugBreakpointAdd(params);
 
-  return withErrorHandling(
-    handlerCtx,
-    async () => {
-      const spec: BreakpointSpec = params.function
-        ? { kind: 'function', name: params.function }
-        : { kind: 'file-line', file: params.file!, line: params.line! };
-
-      const result = await ctx.debugger.addBreakpoint(params.debugSessionId, spec, {
-        condition: params.condition,
-      });
-
-      const rawOutput = result.rawOutput.trim();
-
-      handlerCtx.emit(headerEvent);
-      handlerCtx.emit(statusLine('success', `Breakpoint ${result.id} set`));
-      if (rawOutput) {
-        handlerCtx.emit(section('Output:', rawOutput.split('\n')));
-      }
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to add breakpoint: ${message}`,
-    },
-  );
+  setStructuredOutput(handlerCtx, result);
 }
 
 export const schema = baseSchemaObject.shape;
 
 export const handler = createTypedToolWithContext<DebugBreakpointAddParams, DebuggerToolContext>(
-  debugBreakpointAddSchema as unknown as z.ZodType<DebugBreakpointAddParams, unknown>,
+  toInternalSchema<DebugBreakpointAddParams>(debugBreakpointAddSchema),
   debug_breakpoint_addLogic,
   getDefaultDebuggerToolContext,
 );

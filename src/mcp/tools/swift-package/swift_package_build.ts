@@ -1,5 +1,8 @@
 import * as z from 'zod';
 import path from 'node:path';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { BuildResultDomainResult } from '../../../types/domain-results.ts';
+import type { StreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
@@ -8,11 +11,16 @@ import {
   getSessionAwareToolSchemaShape,
   getHandlerContext,
 } from '../../../utils/typed-tool-factory.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
-import { createXcodebuildPipeline } from '../../../utils/xcodebuild-pipeline.ts';
-import type { StartedPipeline } from '../../../utils/xcodebuild-pipeline.ts';
-import { finalizeInlineXcodebuild } from '../../../utils/xcodebuild-output.ts';
+import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
+import type { BuildInvocationRequest } from '../../../types/domain-fragments.ts';
+import {
+  createBuildDomainResult,
+  createStreamingExecutionContext,
+  createDomainStreamingPipeline,
+} from '../../../utils/xcodebuild-domain-results.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+
+const STRUCTURED_OUTPUT_SCHEMA = 'xcodebuildmcp.output.build-result';
 
 const baseSchemaObject = z.object({
   packagePath: z.string(),
@@ -29,6 +37,93 @@ const publicSchemaObject = baseSchemaObject.omit({
 const swiftPackageBuildSchema = baseSchemaObject;
 
 type SwiftPackageBuildParams = z.infer<typeof swiftPackageBuildSchema>;
+type SwiftPackageBuildResult = BuildResultDomainResult;
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: SwiftPackageBuildResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: STRUCTURED_OUTPUT_SCHEMA,
+    schemaVersion: '1',
+  };
+}
+
+function createBuildSpmInvocationRequest(
+  resolvedPath: string,
+  params: SwiftPackageBuildParams,
+): BuildInvocationRequest {
+  return {
+    packagePath: resolvedPath,
+    ...(params.targetName ? { targetName: params.targetName } : {}),
+    ...(params.configuration ? { configuration: params.configuration } : {}),
+    target: 'swift-package' as const,
+  };
+}
+
+export function createSwiftPackageBuildExecutor(
+  executor: CommandExecutor,
+  request?: BuildInvocationRequest,
+): StreamingExecutor<SwiftPackageBuildParams, SwiftPackageBuildResult> {
+  return async (params, ctx) => {
+    const resolvedPath = path.resolve(params.packagePath);
+    const resolvedRequest = request ?? createBuildSpmInvocationRequest(resolvedPath, params);
+    const swiftArgs = ['build', '--package-path', resolvedPath];
+
+    if (params.configuration?.toLowerCase() === 'release') {
+      swiftArgs.push('-c', 'release');
+    }
+
+    if (params.targetName) {
+      swiftArgs.push('--target', params.targetName);
+    }
+
+    if (params.architectures) {
+      for (const arch of params.architectures) {
+        swiftArgs.push('--arch', arch);
+      }
+    }
+
+    if (params.parseAsLibrary) {
+      swiftArgs.push('-Xswiftc', '-parse-as-library');
+    }
+
+    log('info', `Running swift ${swiftArgs.join(' ')}`);
+
+    const started = createDomainStreamingPipeline('build_spm', 'BUILD', ctx, 'build-result');
+
+    try {
+      const result = await executor(['swift', ...swiftArgs], 'Swift Package Build', false, {
+        onStdout: (chunk: string) => started.pipeline.onStdout(chunk),
+        onStderr: (chunk: string) => started.pipeline.onStderr(chunk),
+      });
+
+      const failureMessage = result.error || result.output || 'Unknown error';
+      return createBuildDomainResult({
+        started,
+        succeeded: result.success,
+        target: 'swift-package',
+        artifacts: {
+          packagePath: resolvedPath,
+          buildLogPath: started.pipeline.logPath,
+        },
+        fallbackErrorMessages: [...started.stderrLines, failureMessage],
+        request: resolvedRequest,
+      });
+    } catch (error) {
+      const message = toErrorMessage(error);
+      return createBuildDomainResult({
+        started,
+        succeeded: false,
+        target: 'swift-package',
+        artifacts: {
+          packagePath: resolvedPath,
+          buildLogPath: started.pipeline.logPath,
+        },
+        fallbackErrorMessages: [...started.stderrLines, message],
+        request: resolvedRequest,
+      });
+    }
+  };
+}
 
 export async function swift_package_buildLogic(
   params: SwiftPackageBuildParams,
@@ -36,85 +131,14 @@ export async function swift_package_buildLogic(
 ): Promise<void> {
   const ctx = getHandlerContext();
   const resolvedPath = path.resolve(params.packagePath);
-  const swiftArgs = ['build', '--package-path', resolvedPath];
 
-  if (params.configuration?.toLowerCase() === 'release') {
-    swiftArgs.push('-c', 'release');
-  }
+  const invocationRequest = createBuildSpmInvocationRequest(resolvedPath, params);
+  ctx.emit(createBuildInvocationFragment('build-result', 'BUILD', invocationRequest));
+  const executionContext = createStreamingExecutionContext(ctx);
+  const executeSwiftPackageBuild = createSwiftPackageBuildExecutor(executor, invocationRequest);
+  const result = await executeSwiftPackageBuild(params, executionContext);
 
-  if (params.targetName) {
-    swiftArgs.push('--target', params.targetName);
-  }
-
-  if (params.architectures) {
-    for (const arch of params.architectures) {
-      swiftArgs.push('--arch', arch);
-    }
-  }
-
-  if (params.parseAsLibrary) {
-    swiftArgs.push('-Xswiftc', '-parse-as-library');
-  }
-
-  log('info', `Running swift ${swiftArgs.join(' ')}`);
-
-  const headerEvent = header('Swift Package Build', [
-    { label: 'Package', value: resolvedPath },
-    ...(params.targetName ? [{ label: 'Target', value: params.targetName }] : []),
-    ...(params.configuration ? [{ label: 'Configuration', value: params.configuration }] : []),
-  ]);
-
-  const pipeline = createXcodebuildPipeline({
-    operation: 'BUILD',
-    toolName: `build_spm`,
-    params: {},
-    emit: ctx.emit,
-  });
-
-  pipeline.emitEvent(headerEvent);
-  const started: StartedPipeline = { pipeline, startedAt: Date.now() };
-
-  return withErrorHandling(
-    ctx,
-    async () => {
-      const result = await executor(['swift', ...swiftArgs], 'Swift Package Build', false, {
-        onStdout: (chunk: string) => pipeline.onStdout(chunk),
-        onStderr: (chunk: string) => pipeline.onStderr(chunk),
-      });
-
-      if (!result.success) {
-        const errorMessage = result.error || result.output || 'Unknown error';
-        finalizeInlineXcodebuild({
-          started,
-          emit: ctx.emit,
-          succeeded: false,
-          durationMs: Date.now() - started.startedAt,
-          responseContent: [
-            {
-              type: 'text',
-              text: `Swift package build failed: ${errorMessage}`,
-            },
-          ],
-        });
-        return;
-      }
-
-      finalizeInlineXcodebuild({
-        started,
-        emit: ctx.emit,
-        succeeded: true,
-        durationMs: Date.now() - started.startedAt,
-      });
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to execute swift build: ${message}`,
-      logMessage: ({ message }) => `Swift package build failed: ${message}`,
-      mapError: ({ message, emit }) => {
-        emit?.(statusLine('error', `Failed to execute swift build: ${message}`));
-      },
-    },
-  );
+  setStructuredOutput(ctx, result);
 }
 
 export const schema = getSessionAwareToolSchemaShape({

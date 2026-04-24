@@ -1,4 +1,7 @@
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { BuildSettingsDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
@@ -6,10 +9,11 @@ import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import { nullifyEmptyStrings, withProjectOrWorkspace } from '../../../utils/schema-helpers.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+import { extractQueryDiagnostics } from '../../../utils/xcodebuild-error-utils.ts';
 
 const baseSchemaObject = z.object({
   projectPath: z.string().optional().describe('Path to the .xcodeproj file'),
@@ -19,16 +23,11 @@ const baseSchemaObject = z.object({
 
 const showBuildSettingsSchema = z.preprocess(
   nullifyEmptyStrings,
-  baseSchemaObject
-    .refine((val) => val.projectPath !== undefined || val.workspacePath !== undefined, {
-      message: 'Either projectPath or workspacePath is required.',
-    })
-    .refine((val) => !(val.projectPath !== undefined && val.workspacePath !== undefined), {
-      message: 'projectPath and workspacePath are mutually exclusive. Provide only one.',
-    }),
+  withProjectOrWorkspace(baseSchemaObject),
 );
 
 export type ShowBuildSettingsParams = z.infer<typeof showBuildSettingsSchema>;
+type ShowBuildSettingsResult = BuildSettingsDomainResult;
 
 function stripXcodebuildPreamble(output: string): string {
   const lines = output.split('\n');
@@ -39,27 +38,88 @@ function stripXcodebuildPreamble(output: string): string {
   return lines.slice(startIndex).join('\n');
 }
 
-export async function showBuildSettingsLogic(
-  params: ShowBuildSettingsParams,
+function parseBuildSettingsEntries(output: string): Array<{ key: string; value: string }> {
+  return output
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .map((line) => {
+      const match = line.match(/^\s*([^=]+?)\s*=(.*)$/);
+      if (match) {
+        const entry = {
+          key: match[1].trim(),
+          value: match[2].trim(),
+        };
+        Object.defineProperties(entry, {
+          __hasEquals: { value: true, enumerable: false },
+          __renderValue: { value: match[2], enumerable: false },
+        });
+        return entry;
+      }
+
+      const entry = {
+        key: line.trim(),
+        value: '',
+      };
+      Object.defineProperties(entry, {
+        __hasEquals: { value: false, enumerable: false },
+        __renderValue: { value: '', enumerable: false },
+      });
+      return entry;
+    });
+}
+
+function createShowBuildSettingsResult(
+  pathValue: string,
+  scheme: string,
+  settingsOutput: string,
+): ShowBuildSettingsResult {
+  return {
+    kind: 'build-settings',
+    didError: false,
+    error: null,
+    artifacts: {
+      workspacePath: pathValue,
+      scheme,
+    },
+    entries: parseBuildSettingsEntries(settingsOutput),
+  };
+}
+
+function createShowBuildSettingsErrorResult(
+  pathValue: string,
+  scheme: string,
+  message: string,
+): ShowBuildSettingsResult {
+  return {
+    kind: 'build-settings',
+    didError: true,
+    error: 'Failed to show build settings.',
+    artifacts: {
+      workspacePath: pathValue,
+      scheme,
+    },
+    entries: [],
+    diagnostics: extractQueryDiagnostics(message),
+  };
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: ShowBuildSettingsResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.build-settings',
+    schemaVersion: '1',
+  };
+}
+
+export function createShowBuildSettingsExecutor(
   executor: CommandExecutor,
-): Promise<void> {
-  log('info', `Showing build settings for scheme ${params.scheme}`);
+): NonStreamingExecutor<ShowBuildSettingsParams, ShowBuildSettingsResult> {
+  return async (params) => {
+    const hasProjectPath = typeof params.projectPath === 'string';
+    const pathValue = hasProjectPath ? params.projectPath! : params.workspacePath!;
 
-  const hasProjectPath = typeof params.projectPath === 'string';
-  const pathValue = hasProjectPath ? params.projectPath : params.workspacePath;
-
-  const headerEvent = header('Show Build Settings', [
-    { label: 'Scheme', value: params.scheme },
-    ...(hasProjectPath
-      ? [{ label: 'Project', value: params.projectPath! }]
-      : [{ label: 'Workspace', value: params.workspacePath! }]),
-  ]);
-
-  const ctx = getHandlerContext();
-
-  return withErrorHandling(
-    ctx,
-    async () => {
+    try {
       const command = ['xcodebuild', '-showBuildSettings'];
 
       if (hasProjectPath) {
@@ -71,36 +131,52 @@ export async function showBuildSettingsLogic(
       command.push('-scheme', params.scheme);
 
       const result = await executor(command, 'Show Build Settings', false);
-
       if (!result.success) {
-        ctx.emit(headerEvent);
-        ctx.emit(statusLine('error', result.error || 'Unknown error'));
-        return;
+        return createShowBuildSettingsErrorResult(
+          pathValue,
+          params.scheme,
+          result.error || result.output || 'Unknown error',
+        );
       }
 
       const settingsOutput = stripXcodebuildPreamble(
         result.output || 'Build settings retrieved successfully.',
       );
 
-      const pathKey = hasProjectPath ? 'projectPath' : 'workspacePath';
-      ctx.nextStepParams = {
-        build_macos: { [pathKey]: pathValue!, scheme: params.scheme },
-        build_sim: { [pathKey]: pathValue!, scheme: params.scheme, simulatorName: 'iPhone 17' },
-        list_schemes: { [pathKey]: pathValue! },
-      };
+      return createShowBuildSettingsResult(pathValue, params.scheme, settingsOutput);
+    } catch (error) {
+      return createShowBuildSettingsErrorResult(pathValue, params.scheme, toErrorMessage(error));
+    }
+  };
+}
 
-      const settingsLines = settingsOutput.split('\n').filter((l) => l.trim());
+export async function showBuildSettingsLogic(
+  params: ShowBuildSettingsParams,
+  executor: CommandExecutor,
+): Promise<void> {
+  log('info', `Showing build settings for scheme ${params.scheme}`);
 
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('success', 'Build settings retrieved'));
-      ctx.emit(section('Settings', settingsLines));
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => message,
-      logMessage: ({ message }) => `Error showing build settings: ${message}`,
-    },
-  );
+  const hasProjectPath = typeof params.projectPath === 'string';
+  const pathValue = hasProjectPath ? params.projectPath : params.workspacePath;
+
+  const ctx = getHandlerContext();
+  const executeShowBuildSettings = createShowBuildSettingsExecutor(executor);
+  const result = await executeShowBuildSettings(params);
+
+  setStructuredOutput(ctx, result);
+
+  if (result.didError) {
+    log('error', `Error showing build settings: ${result.error ?? 'Unknown error'}`);
+  }
+
+  if (!result.didError) {
+    const pathKey = hasProjectPath ? 'projectPath' : 'workspacePath';
+    ctx.nextStepParams = {
+      build_macos: { [pathKey]: pathValue!, scheme: params.scheme },
+      build_sim: { [pathKey]: pathValue!, scheme: params.scheme, simulatorName: 'iPhone 17' },
+      list_schemes: { [pathKey]: pathValue! },
+    };
+  }
 }
 
 const publicSchemaObject = baseSchemaObject.omit({
@@ -115,7 +191,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<ShowBuildSettingsParams>({
-  internalSchema: showBuildSettingsSchema as unknown as z.ZodType<ShowBuildSettingsParams, unknown>,
+  internalSchema: toInternalSchema<ShowBuildSettingsParams>(showBuildSettingsSchema),
   logicFunction: showBuildSettingsLogic,
   getExecutor: getDefaultCommandExecutor,
   requirements: [

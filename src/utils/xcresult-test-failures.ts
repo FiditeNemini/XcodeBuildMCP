@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { log } from './logger.ts';
-import type { PipelineEvent } from '../types/pipeline-events.ts';
+import type { TestFailureFragment } from '../types/domain-fragments.ts';
 import { parseRawTestName } from './xcodebuild-line-parsers.ts';
 
 interface XcresultTestNode {
@@ -14,11 +14,7 @@ interface XcresultTestResults {
   testNodes: XcresultTestNode[];
 }
 
-/**
- * Extract test failure events from an xcresult bundle using xcresulttool.
- * Returns test-failure PipelineEvents for any failed test cases found.
- */
-export function extractTestFailuresFromXcresult(xcresultPath: string): PipelineEvent[] {
+export function extractTestFailuresFromXcresult(xcresultPath: string): TestFailureFragment[] {
   try {
     const output = execFileSync(
       'xcrun',
@@ -27,7 +23,7 @@ export function extractTestFailuresFromXcresult(xcresultPath: string): PipelineE
     );
 
     const results: XcresultTestResults = JSON.parse(output);
-    const events: PipelineEvent[] = [];
+    const fragments: TestFailureFragment[] = [];
 
     function walk(node: XcresultTestNode, suiteContext?: string): void {
       const parsedNodeName = parseRawTestName(node.name);
@@ -42,9 +38,9 @@ export function extractTestFailuresFromXcresult(xcresultPath: string): PipelineE
           if (child.nodeType === 'Failure Message') {
             const parsed = parseFailureMessage(child.name);
             const { suiteName, testName } = parsedNodeName;
-            events.push({
-              type: 'test-failure',
-              timestamp: new Date().toISOString(),
+            fragments.push({
+              kind: 'test-result',
+              fragment: 'test-failure',
               operation: 'TEST',
               suite: suiteName ?? suiteContext,
               test: testName,
@@ -65,7 +61,7 @@ export function extractTestFailuresFromXcresult(xcresultPath: string): PipelineE
       walk(root);
     }
 
-    return events;
+    return fragments;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     log('debug', `Failed to extract test failures from xcresult: ${message}`);
@@ -73,11 +69,6 @@ export function extractTestFailuresFromXcresult(xcresultPath: string): PipelineE
   }
 }
 
-/**
- * Parse a failure message string from xcresulttool.
- * Format: "File.swift:11: Expectation failed: 1 == 2: User message"
- * or just: "Some failure message"
- */
 function parseFailureMessage(raw: string): { message: string; location?: string } {
   const match = raw.match(/^(.+?):(\d+): (.+)$/);
   if (match) {

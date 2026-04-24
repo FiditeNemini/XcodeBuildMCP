@@ -17,7 +17,9 @@ import {
 } from '../config-store.ts';
 import { createRenderSession } from '../../rendering/render.ts';
 import type { ToolHandlerContext } from '../../rendering/types.ts';
-import { statusLine } from '../tool-event-builders.ts';
+import type { AnyFragment } from '../../types/domain-fragments.ts';
+import type { RuntimeStatusFragment } from '../../types/runtime-status.ts';
+import { renderCliTextTranscript } from '../renderers/cli-text-renderer.ts';
 
 const cwd = '/repo';
 
@@ -26,17 +28,30 @@ async function initConfigStoreForTest(overrides?: RuntimeConfigOverrides): Promi
   await initConfigStore({ cwd, fs: createMockFileSystemExecutor(), overrides });
 }
 
+function statusFragment(
+  level: 'info' | 'warning' | 'error' | 'success',
+  message: string,
+): RuntimeStatusFragment {
+  return { kind: 'infrastructure', fragment: 'status', level, message };
+}
+
 function invokeAndCollect(
   handler: ToolHandler,
   args: Record<string, unknown>,
 ): Promise<{ text: string; isError: boolean }> {
   const session = createRenderSession('text');
+  const items: AnyFragment[] = [];
   const ctx: ToolHandlerContext = {
-    emit: (event) => session.emit(event),
+    liveProgressEnabled: false,
+    streamingFragmentsEnabled: false,
+    emit: (event) => {
+      items.push(event);
+      session.emit(event);
+    },
     attach: (image) => session.attach(image),
   };
   return handler(args, ctx).then(() => ({
-    text: session.finalize(),
+    text: renderCliTextTranscript({ items }),
     isError: session.isError(),
   }));
 }
@@ -68,7 +83,7 @@ describe('createSessionAwareTool', () => {
 
   async function logic(_params: Params): Promise<void> {
     const ctx = getHandlerContext();
-    ctx.emit(statusLine('success', 'OK'));
+    ctx.emit(statusFragment('success', 'OK'));
   }
 
   const handler = createSessionAwareTool<Params>({
@@ -99,7 +114,7 @@ describe('createSessionAwareTool', () => {
       internalSchema,
       logicFunction: async (params) => {
         const ctx = getHandlerContext();
-        ctx.emit(statusLine('success', params.scheme));
+        ctx.emit(statusFragment('success', params.scheme));
       },
       getExecutor: () => createMockExecutor({ success: true }),
       requirements: [
@@ -225,7 +240,7 @@ describe('createSessionAwareTool', () => {
       internalSchema: internalSchemaNoXor,
       logicFunction: (async () => {
         const ctx = getHandlerContext();
-        ctx.emit(statusLine('success', 'OK'));
+        ctx.emit(statusFragment('success', 'OK'));
       }) as (params: z.infer<typeof internalSchemaNoXor>, executor: unknown) => Promise<void>,
       getExecutor: () => createMockExecutor({ success: true }),
       requirements: [{ allOf: ['scheme'], message: 'scheme is required' }],
@@ -257,7 +272,7 @@ describe('createSessionAwareTool', () => {
       logicFunction: async (params) => {
         const ctx = getHandlerContext();
         ctx.emit(
-          statusLine(
+          statusFragment(
             'success',
             JSON.stringify({
               simulatorId: params.simulatorId,
@@ -297,7 +312,7 @@ describe('createSessionAwareTool', () => {
       internalSchema: envSchema,
       logicFunction: async (params) => {
         const ctx = getHandlerContext();
-        ctx.emit(statusLine('success', JSON.stringify(params.env)));
+        ctx.emit(statusFragment('success', JSON.stringify(params.env)));
       },
       getExecutor: () => createMockExecutor({ success: true }),
       requirements: [{ allOf: ['scheme'] }],
@@ -327,7 +342,7 @@ describe('createSessionAwareTool', () => {
       internalSchema: envSchema,
       logicFunction: async (params) => {
         const ctx = getHandlerContext();
-        ctx.emit(statusLine('success', JSON.stringify(params.env)));
+        ctx.emit(statusFragment('success', JSON.stringify(params.env)));
       },
       getExecutor: () => createMockExecutor({ success: true }),
       requirements: [{ allOf: ['scheme'] }],

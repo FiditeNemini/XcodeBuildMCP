@@ -5,17 +5,22 @@ import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultDebuggerManager } from '../../../utils/debugger/index.ts';
 import type { DebuggerManager } from '../../../utils/debugger/debugger-manager.ts';
 import { guardUiAutomationAgainstStoppedDebugger } from '../../../utils/debugger/ui-automation-guard.ts';
-import { AXE_NOT_AVAILABLE_MESSAGE } from '../../../utils/axe-helpers.ts';
-import { DependencyError, AxeError, SystemError } from '../../../utils/errors.ts';
 import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
 import { executeAxeCommand, defaultAxeHelpers } from './shared/axe-command.ts';
 import type { AxeHelpers } from './shared/axe-command.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, section } from '../../../utils/tool-event-builders.ts';
+import type { UiActionResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
+import {
+  createUiActionFailureResult,
+  createUiActionSuccessResult,
+  mapAxeCommandError,
+  setUiActionStructuredOutput,
+} from './shared/domain-result.ts';
 
 const buttonSchema = z.object({
   simulatorId: z.uuid({ message: 'Invalid Simulator UUID format' }),
@@ -30,8 +35,51 @@ const buttonSchema = z.object({
 });
 
 type ButtonParams = z.infer<typeof buttonSchema>;
+type ButtonResult = UiActionResultDomainResult;
 
 const LOG_PREFIX = '[AXe]';
+
+export function createButtonExecutor(
+  executor: CommandExecutor,
+  axeHelpers: AxeHelpers = defaultAxeHelpers,
+  debuggerManager: DebuggerManager = getDefaultDebuggerManager(),
+): NonStreamingExecutor<ButtonParams, ButtonResult> {
+  return async (params) => {
+    const toolName = 'button';
+    const { simulatorId, buttonType, duration } = params;
+    const action = { type: 'button' as const, button: buttonType };
+
+    const guard = await guardUiAutomationAgainstStoppedDebugger({
+      debugger: debuggerManager,
+      simulatorId,
+      toolName,
+    });
+    if (guard.blockedMessage) {
+      return createUiActionFailureResult(action, simulatorId, guard.blockedMessage);
+    }
+
+    const commandArgs = ['button', buttonType];
+    if (duration !== undefined) {
+      commandArgs.push('--duration', String(duration));
+    }
+
+    log('info', `${LOG_PREFIX}/${toolName}: Starting ${buttonType} button press on ${simulatorId}`);
+
+    try {
+      await executeAxeCommand(commandArgs, simulatorId, 'button', executor, axeHelpers);
+      log('info', `${LOG_PREFIX}/${toolName}: Success for ${simulatorId}`);
+      return createUiActionSuccessResult(action, simulatorId, [guard.warningText]);
+    } catch (error) {
+      const failure = mapAxeCommandError(error, {
+        axeFailureMessage: () => `Failed to press button '${buttonType}'.`,
+      });
+      log('error', `${LOG_PREFIX}/${toolName}: Failed - ${failure.message}`);
+      return createUiActionFailureResult(action, simulatorId, failure.message, {
+        details: failure.diagnostics?.errors.map((entry) => entry.message),
+      });
+    }
+  };
+}
 
 export async function buttonLogic(
   params: ButtonParams,
@@ -39,67 +87,11 @@ export async function buttonLogic(
   axeHelpers: AxeHelpers = defaultAxeHelpers,
   debuggerManager: DebuggerManager = getDefaultDebuggerManager(),
 ): Promise<void> {
-  const toolName = 'button';
-  const { simulatorId, buttonType, duration } = params;
-
-  const headerEvent = header('Button', [{ label: 'Simulator', value: simulatorId }]);
-
   const ctx = getHandlerContext();
+  const executeButton = createButtonExecutor(executor, axeHelpers, debuggerManager);
+  const result = await executeButton(params);
 
-  const guard = await guardUiAutomationAgainstStoppedDebugger({
-    debugger: debuggerManager,
-    simulatorId,
-    toolName,
-  });
-  if (guard.blockedMessage) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', guard.blockedMessage));
-    return;
-  }
-
-  const commandArgs = ['button', buttonType];
-  if (duration !== undefined) {
-    commandArgs.push('--duration', String(duration));
-  }
-
-  log('info', `${LOG_PREFIX}/${toolName}: Starting ${buttonType} button press on ${simulatorId}`);
-
-  return withErrorHandling(
-    ctx,
-    async () => {
-      await executeAxeCommand(commandArgs, simulatorId, 'button', executor, axeHelpers);
-      log('info', `${LOG_PREFIX}/${toolName}: Success for ${simulatorId}`);
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('success', `Hardware button '${buttonType}' pressed successfully.`));
-      if (guard.warningText) {
-        ctx.emit(statusLine('warning', guard.warningText));
-      }
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `An unexpected error occurred: ${message}`,
-      logMessage: ({ error }) => `${LOG_PREFIX}/${toolName}: Failed - ${error}`,
-      mapError: ({ error, headerEvent: hdr, emit }) => {
-        if (error instanceof DependencyError) {
-          emit?.(hdr);
-          emit?.(statusLine('error', AXE_NOT_AVAILABLE_MESSAGE));
-          return;
-        } else if (error instanceof AxeError) {
-          emit?.(hdr);
-          emit?.(statusLine('error', `Failed to press button '${buttonType}': ${error.message}`));
-          if (error.axeOutput) emit?.(section('Details', [error.axeOutput]));
-          return;
-        } else if (error instanceof SystemError) {
-          emit?.(hdr);
-          emit?.(statusLine('error', `System error executing axe: ${error.message}`));
-          if (error.originalError?.stack)
-            emit?.(section('Stack Trace', [error.originalError.stack]));
-          return;
-        }
-        return undefined;
-      },
-    },
-  );
+  setUiActionStructuredOutput(ctx, result);
 }
 
 const publicSchemaObject = z.strictObject(buttonSchema.omit({ simulatorId: true } as const).shape);
@@ -110,7 +102,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<ButtonParams>({
-  internalSchema: buttonSchema as unknown as z.ZodType<ButtonParams, unknown>,
+  internalSchema: toInternalSchema<ButtonParams>(buttonSchema),
   logicFunction: (params: ButtonParams, executor: CommandExecutor) =>
     buttonLogic(params, executor, defaultAxeHelpers),
   getExecutor: getDefaultCommandExecutor,

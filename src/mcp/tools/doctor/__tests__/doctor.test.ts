@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import * as z from 'zod';
-import { schema, runDoctor, type DoctorDependencies } from '../doctor.ts';
+import { createDoctorExecutor, schema, runDoctor, type DoctorDependencies } from '../doctor.ts';
 import { createMockExecutor } from '../../../../test-utils/mock-executors.ts';
 import { allText } from '../../../../test-utils/test-helpers.ts';
 
@@ -132,6 +132,27 @@ describe('doctor tool', () => {
   });
 
   describe('Handler Behavior (Complete Literal Returns)', () => {
+    it('returns a result without requiring an execution context', async () => {
+      const executeDoctor = createDoctorExecutor(createDeps());
+      const result = await executeDoctor({});
+
+      expect(result.didError).toBe(false);
+    });
+
+    it('keeps doctor executor failure summary short and preserves diagnostics', async () => {
+      const deps = createDeps();
+      deps.env.getSystemInfo = () => {
+        throw new Error('system profiler failed');
+      };
+      const executeDoctor = createDoctorExecutor(deps);
+
+      const result = await executeDoctor({});
+
+      expect(result.didError).toBe(true);
+      expect(result.error).toBe('Doctor failed.');
+      expect(result.diagnostics?.errors).toEqual([{ message: 'system profiler failed' }]);
+    });
+
     it('should handle successful doctor execution', async () => {
       const deps = createDeps();
       const result = await runDoctor({}, deps);

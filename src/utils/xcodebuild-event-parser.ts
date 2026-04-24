@@ -1,8 +1,5 @@
-import type {
-  XcodebuildOperation,
-  PipelineEvent,
-  XcodebuildStage,
-} from '../types/pipeline-events.ts';
+import type { XcodebuildOperation, XcodebuildStage } from '../types/domain-fragments.ts';
+import type { BuildLikeKind, DomainFragment } from '../types/domain-fragments.ts';
 import {
   packageResolutionPatterns,
   compilePatterns,
@@ -12,6 +9,7 @@ import {
   parseFailureDiagnostic,
   parseBuildErrorDiagnostic,
   parseDurationMs,
+  isBuildErrorDiagnosticLine,
 } from './xcodebuild-line-parsers.ts';
 import {
   parseXcodebuildSwiftTestingLine,
@@ -89,13 +87,10 @@ function isIgnoredNoiseLine(line: string): boolean {
   return IGNORED_NOISE_PATTERNS.some((pattern) => pattern.test(line));
 }
 
-function now(): string {
-  return new Date().toISOString();
-}
-
 export interface EventParserOptions {
   operation: XcodebuildOperation;
-  onEvent: (event: PipelineEvent) => void;
+  kind?: BuildLikeKind;
+  onEvent: (fragment: DomainFragment) => void;
   onUnrecognizedLine?: (line: string) => void;
 }
 
@@ -108,6 +103,8 @@ export interface XcodebuildEventParser {
 
 export function createXcodebuildEventParser(options: EventParserOptions): XcodebuildEventParser {
   const { operation, onEvent, onUnrecognizedLine } = options;
+  const kind: BuildLikeKind =
+    options.kind ?? (operation === 'TEST' ? 'test-result' : 'build-result');
 
   let stdoutBuffer = '';
   let stderrBuffer = '';
@@ -120,7 +117,6 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     message: string;
     location?: string;
     rawLines: string[];
-    timestamp: string;
   } | null = null;
 
   const pendingFailureDiagnostics = new Map<
@@ -137,7 +133,7 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     return `${suiteName ?? ''}::${testName ?? ''}`.trim().toLowerCase();
   }
 
-  function emitFailureEvent(failure: {
+  function emitFailureFragment(failure: {
     suiteName?: string;
     testName?: string;
     message: string;
@@ -149,8 +145,8 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     }
 
     onEvent({
-      type: 'test-failure',
-      timestamp: now(),
+      kind: 'test-result',
+      fragment: 'test-failure',
       operation: 'TEST',
       suite: failure.suiteName,
       test: failure.testName,
@@ -168,14 +164,14 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
   }): void {
     const key = getFailureKey(failure.suiteName, failure.testName);
     if (!key) {
-      emitFailureEvent(failure);
+      emitFailureFragment(failure);
       return;
     }
 
     const durationMs = pendingFailureDurations.get(key);
     if (durationMs !== undefined) {
       pendingFailureDurations.delete(key);
-      emitFailureEvent({ ...failure, durationMs });
+      emitFailureFragment({ ...failure, durationMs });
       return;
     }
 
@@ -188,7 +184,7 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     for (const [key, failures] of pendingFailureDiagnostics.entries()) {
       const durationMs = pendingFailureDurations.get(key);
       for (const failure of failures) {
-        emitFailureEvent({ ...failure, durationMs });
+        emitFailureFragment({ ...failure, durationMs });
       }
     }
     pendingFailureDiagnostics.clear();
@@ -207,7 +203,7 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     }
 
     for (const failure of pendingFailures) {
-      emitFailureEvent({ ...failure, durationMs });
+      emitFailureFragment({ ...failure, durationMs });
     }
     pendingFailureDiagnostics.delete(key);
     pendingFailureDurations.delete(key);
@@ -218,8 +214,8 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
       return;
     }
     onEvent({
-      type: 'test-progress',
-      timestamp: now(),
+      kind: 'test-result',
+      fragment: 'test-progress',
       operation: 'TEST',
       completed: completedCount,
       failed: failedCount,
@@ -255,9 +251,10 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
       return;
     }
     onEvent({
-      type: 'compiler-error',
-      timestamp: pendingError.timestamp,
+      kind,
+      fragment: 'compiler-diagnostic',
       operation,
+      severity: 'error',
       message: pendingError.message,
       location: pendingError.location,
       rawLine: pendingError.rawLines.join('\n'),
@@ -272,7 +269,6 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
       return;
     }
 
-    // Swift Testing continuation line (↳) appends context to pending issue
     const stContinuation = parseSwiftTestingContinuationLine(line);
     if (stContinuation) {
       const lastQueuedEntry = Array.from(pendingFailureDiagnostics.values()).at(-1)?.at(-1);
@@ -298,8 +294,8 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
 
     const totals = parseTotalsLine(line);
     if (totals) {
-      completedCount = totals.executed;
-      failedCount = totals.failed;
+      completedCount = Math.max(completedCount, totals.executed);
+      failedCount = Math.max(failedCount, totals.failed);
       emitTestProgress();
       return;
     }
@@ -316,7 +312,6 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
       return;
     }
 
-    // Swift Testing issue: ✘ Test "Name" recorded an issue at file:line:col: message
     const stIssue = parseSwiftTestingIssueLine(line);
     if (stIssue) {
       queueFailureDiagnostic(stIssue);
@@ -331,8 +326,8 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
 
     const stSummary = parseSwiftTestingRunSummary(line);
     if (stSummary) {
-      completedCount = stSummary.executed;
-      failedCount = stSummary.failed;
+      completedCount = Math.max(completedCount, stSummary.executed);
+      failedCount = Math.max(failedCount, stSummary.failed);
       emitTestProgress();
       return;
     }
@@ -340,8 +335,8 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     const stage = resolveStageFromLine(line);
     if (stage) {
       onEvent({
-        type: 'build-stage',
-        timestamp: now(),
+        kind,
+        fragment: 'build-stage',
         operation,
         stage,
         message: stageMessages[stage],
@@ -355,7 +350,6 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
         message: buildError.message,
         location: buildError.location,
         rawLines: [line],
-        timestamp: now(),
       };
       return;
     }
@@ -363,9 +357,10 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
     const warning = parseWarningLine(line);
     if (warning) {
       onEvent({
-        type: 'compiler-warning',
-        timestamp: now(),
+        kind,
+        fragment: 'compiler-diagnostic',
         operation,
+        severity: 'warning',
         message: warning.message,
         location: warning.location,
         rawLine: line,
@@ -381,7 +376,18 @@ export function createXcodebuildEventParser(options: EventParserOptions): Xcodeb
       return;
     }
 
-    // Capture xcresult path from xcodebuild output
+    if (isBuildErrorDiagnosticLine(line)) {
+      onEvent({
+        kind,
+        fragment: 'compiler-diagnostic',
+        operation,
+        severity: 'error',
+        message: line,
+        rawLine: line,
+      });
+      return;
+    }
+
     const xcresultMatch = line.match(/^\s*(\S+\.xcresult)\s*$/u);
     if (xcresultMatch) {
       detectedXcresultPath = xcresultMatch[1];

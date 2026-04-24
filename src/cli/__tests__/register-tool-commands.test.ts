@@ -2,8 +2,8 @@ import yargs from 'yargs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as z from 'zod';
 import type { ToolCatalog, ToolDefinition } from '../../runtime/types.ts';
+import type { ToolHandlerContext } from '../../rendering/types.ts';
 import { DefaultToolInvoker } from '../../runtime/tool-invoker.ts';
-import { createTextContent } from '../../types/common.ts';
 import type { ResolvedRuntimeConfig } from '../../utils/config-store.ts';
 import { registerToolCommands } from '../register-tool-commands.ts';
 
@@ -82,6 +82,30 @@ function createApp(catalog: ToolCatalog, runtimeConfig: ResolvedRuntimeConfig = 
   });
 
   return app;
+}
+
+function mockInvokeDirectThroughHandler() {
+  return vi
+    .spyOn(DefaultToolInvoker.prototype, 'invokeDirect')
+    .mockImplementation(async (tool, args, opts) => {
+      const handlerContext: ToolHandlerContext = opts.handlerContext ?? {
+        emit: (fragment) => {
+          opts.onProgress?.(fragment);
+          opts.renderSession?.emit(fragment);
+        },
+        attach: (image) => {
+          opts.renderSession?.attach(image);
+        },
+        liveProgressEnabled: Boolean(opts.onProgress),
+        streamingFragmentsEnabled: Boolean(opts.onProgress),
+      };
+
+      await tool.handler(args, handlerContext);
+
+      if (handlerContext.structuredOutput && opts.onStructuredOutput) {
+        opts.onStructuredOutput(handlerContext.structuredOutput);
+      }
+    });
 }
 
 describe('registerToolCommands', () => {
@@ -349,5 +373,250 @@ describe('registerToolCommands', () => {
     );
 
     stdoutWrite.mockRestore();
+  });
+
+  it('writes a structured envelope for tools that provide structured output', async () => {
+    mockInvokeDirectThroughHandler();
+    const stdoutChunks: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      stdoutChunks.push(String(chunk));
+      return true;
+    });
+
+    const tool = createTool({
+      handler: vi.fn(async (_args, ctx) => {
+        ctx?.emit({
+          kind: 'presentation',
+          fragment: 'status',
+          level: 'info',
+          message: 'legacy event',
+        });
+
+        if (ctx) {
+          ctx.structuredOutput = {
+            schema: 'xcodebuildmcp.output.simulator-list',
+            schemaVersion: '1',
+            result: {
+              kind: 'simulator-list',
+              didError: false,
+              error: null,
+              simulators: [
+                {
+                  name: 'iPhone 15',
+                  simulatorId: 'test-uuid-123',
+                  state: 'Shutdown',
+                  isAvailable: true,
+                  runtime: 'iOS 17.0',
+                },
+              ],
+            },
+          };
+        }
+      }) as ToolDefinition['handler'],
+    });
+    const app = createApp(createCatalog([tool]));
+
+    await expect(
+      app.parseAsync(['simulator', 'run-tool', '--output', 'json']),
+    ).resolves.toBeDefined();
+
+    expect(stdoutChunks.join('')).toBe(
+      `${JSON.stringify(
+        {
+          schema: 'xcodebuildmcp.output.simulator-list',
+          schemaVersion: '1',
+          didError: false,
+          error: null,
+          data: {
+            simulators: [
+              {
+                name: 'iPhone 15',
+                simulatorId: 'test-uuid-123',
+                state: 'Shutdown',
+                isAvailable: true,
+                runtime: 'iOS 17.0',
+              },
+            ],
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  });
+
+  it('writes one NDJSON line per domain fragment for jsonl output and omits the final envelope', async () => {
+    mockInvokeDirectThroughHandler();
+    const stdoutChunks: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      stdoutChunks.push(String(chunk));
+      return true;
+    });
+
+    const tool = createTool({
+      handler: vi.fn(async (_args, ctx) => {
+        ctx?.emit({
+          kind: 'presentation',
+          fragment: 'status',
+          level: 'info',
+          message: 'Starting work',
+        });
+        ctx?.emit({
+          kind: 'presentation',
+          fragment: 'artifact',
+          name: 'Build Log',
+          path: '/tmp/build.log',
+        });
+
+        if (ctx) {
+          ctx.structuredOutput = {
+            schema: 'xcodebuildmcp.output.simulator-list',
+            schemaVersion: '1',
+            result: {
+              kind: 'simulator-list',
+              didError: false,
+              error: null,
+              simulators: [],
+            },
+          };
+        }
+      }) as ToolDefinition['handler'],
+    });
+    const app = createApp(createCatalog([tool]));
+
+    await expect(
+      app.parseAsync(['simulator', 'run-tool', '--output', 'jsonl']),
+    ).resolves.toBeDefined();
+
+    expect(stdoutChunks.join('')).toBe(
+      `${JSON.stringify({ event: 'presentation.status', level: 'info', message: 'Starting work' })}\n` +
+        `${JSON.stringify({ event: 'presentation.artifact', name: 'Build Log', path: '/tmp/build.log' })}\n`,
+    );
+  });
+
+  it('does not duplicate daemon-streamed fragments in the render session for jsonl output', async () => {
+    const streamedFragment = {
+      kind: 'transcript',
+      fragment: 'process-line',
+      stream: 'stderr',
+      line: 'Build Log: /tmp/build.log\n',
+    } as const;
+    let observedSessionFragmentCount = 0;
+
+    vi.spyOn(DefaultToolInvoker.prototype, 'invokeDirect').mockImplementation(
+      async (_tool, _args, opts) => {
+        opts.renderSession?.emit(streamedFragment);
+        opts.onProgress?.(streamedFragment);
+        observedSessionFragmentCount = opts.renderSession?.getFragments().length ?? 0;
+        opts.onStructuredOutput?.({
+          schema: 'xcodebuildmcp.output.simulator-list',
+          schemaVersion: '1',
+          result: {
+            kind: 'simulator-list',
+            didError: false,
+            error: null,
+            simulators: [],
+          },
+        });
+      },
+    );
+
+    const stdoutChunks: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      stdoutChunks.push(String(chunk));
+      return true;
+    });
+
+    const tool = createTool({ stateful: true });
+    const app = createApp(createCatalog([tool]));
+
+    await expect(
+      app.parseAsync(['simulator', 'run-tool', '--output', 'jsonl']),
+    ).resolves.toBeDefined();
+
+    expect(observedSessionFragmentCount).toBe(1);
+    expect(stdoutChunks.join('')).toBe(
+      `${JSON.stringify({
+        event: 'transcript.process-line',
+        stream: 'stderr',
+        line: 'Build Log: /tmp/build.log\n',
+      })}\n`,
+    );
+  });
+
+  it('writes a JSON error envelope when no structured output is available for json mode', async () => {
+    mockInvokeDirectThroughHandler();
+    const stdoutChunks: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      stdoutChunks.push(String(chunk));
+      return true;
+    });
+
+    const tool = createTool({
+      handler: vi.fn(async (_args, ctx) => {
+        ctx?.emit({
+          kind: 'presentation',
+          fragment: 'status',
+          level: 'info',
+          message: 'legacy event',
+        });
+      }) as ToolDefinition['handler'],
+    });
+    const app = createApp(createCatalog([tool]));
+
+    await expect(
+      app.parseAsync(['simulator', 'run-tool', '--output', 'json']),
+    ).resolves.toBeDefined();
+
+    expect(stdoutChunks.join('')).toBe(
+      `${JSON.stringify(
+        {
+          schema: 'xcodebuildmcp.output.error',
+          schemaVersion: '1',
+          didError: true,
+          error: 'Tool did not produce structured output for --output json',
+          data: null,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('rejects json and jsonl output for xcode-ide tools', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const tool = createTool({ workflow: 'xcode-ide' });
+    const app = yargs()
+      .scriptName('xcodebuildmcp')
+      .exitProcess(false)
+      .fail((message, error) => {
+        throw error ?? new Error(message);
+      });
+
+    registerToolCommands(app, createCatalog([tool]), {
+      workspaceRoot: '/repo',
+      runtimeConfig: baseRuntimeConfig,
+      cliExposedWorkflowIds: ['xcode-ide'],
+      workflowNames: ['xcode-ide'],
+    });
+
+    await expect(
+      app.parseAsync(['xcode-ide', 'run-tool', '--output', 'json']),
+    ).resolves.toBeDefined();
+    expect(consoleError).toHaveBeenLastCalledWith(
+      'Error: --output json is not supported for xcode-ide tools yet',
+    );
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = undefined;
+
+    await expect(
+      app.parseAsync(['xcode-ide', 'run-tool', '--output', 'jsonl']),
+    ).resolves.toBeDefined();
+    expect(consoleError).toHaveBeenLastCalledWith(
+      'Error: --output jsonl is not supported for xcode-ide tools yet',
+    );
+    expect(process.exitCode).toBe(1);
   });
 });

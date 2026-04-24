@@ -1,5 +1,8 @@
 import * as z from 'zod';
 import path from 'node:path';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { BuildRunResultDomainResult } from '../../../types/domain-results.ts';
+import type { StreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import type { CommandExecutor, CommandResponse } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
@@ -10,15 +13,14 @@ import {
   getHandlerContext,
 } from '../../../utils/typed-tool-factory.ts';
 import { acquireDaemonActivity } from '../../../daemon/activity-registry.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine, section, detailTree } from '../../../utils/tool-event-builders.ts';
-import { createXcodebuildPipeline } from '../../../utils/xcodebuild-pipeline.ts';
-import type { StartedPipeline } from '../../../utils/xcodebuild-pipeline.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import {
-  createBuildRunResultEvents,
-  finalizeInlineXcodebuild,
-} from '../../../utils/xcodebuild-output.ts';
-import { displayPath } from '../../../utils/build-preflight.ts';
+  createBuildRunDomainResult,
+  createDomainStreamingPipeline,
+  createStreamingExecutionContext,
+} from '../../../utils/xcodebuild-domain-results.ts';
+import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
+import type { BuildInvocationRequest } from '../../../types/domain-fragments.ts';
 
 const baseSchemaObject = z.object({
   packagePath: z.string(),
@@ -35,6 +37,7 @@ const publicSchemaObject = baseSchemaObject.omit({
 } as const);
 
 type SwiftPackageRunParams = z.infer<typeof baseSchemaObject>;
+type SwiftPackageRunResult = BuildRunResultDomainResult;
 
 type SwiftPackageRunTimeoutResult = {
   success: boolean;
@@ -73,48 +76,109 @@ async function resolveExecutablePath(
   return path.join(binPath, executableName);
 }
 
+const STRUCTURED_OUTPUT_SCHEMA = 'xcodebuildmcp.output.build-run-result';
+
+function createRunSpmInvocationRequest(
+  resolvedPath: string,
+  executableName: string,
+): BuildInvocationRequest {
+  return {
+    packagePath: resolvedPath,
+    executableName,
+    target: 'swift-package' as const,
+  };
+}
+
 export async function swift_package_runLogic(
   params: SwiftPackageRunParams,
   executor: CommandExecutor,
 ): Promise<void> {
   const ctx = getHandlerContext();
   const resolvedPath = path.resolve(params.packagePath);
-  const timeout = Math.min(params.timeout ?? 30, 300) * 1000; // Convert to ms, max 5 minutes
+  const invocationRequest = createRunSpmInvocationRequest(
+    resolvedPath,
+    params.executableName ?? path.basename(resolvedPath),
+  );
+  ctx.emit(createBuildInvocationFragment('build-run-result', 'BUILD', invocationRequest));
+  const executionContext = createStreamingExecutionContext(ctx);
+  const executeSwiftPackageRun = createSwiftPackageRunExecutor(executor, invocationRequest);
+  const result = await executeSwiftPackageRun(params, executionContext);
 
-  const swiftArgs = ['run', '--package-path', resolvedPath];
+  setStructuredOutput(ctx, result);
 
-  const headerEvent = header('Swift Package Run', [
-    { label: 'Package', value: resolvedPath },
-    ...(params.executableName ? [{ label: 'Executable', value: params.executableName }] : []),
-    ...(params.background ? [{ label: 'Mode', value: 'background' }] : []),
-  ]);
-
-  if (params.configuration?.toLowerCase() === 'release') {
-    swiftArgs.push('-c', 'release');
-  } else if (params.configuration && params.configuration.toLowerCase() !== 'debug') {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', "Invalid configuration. Use 'debug' or 'release'."));
+  if (result.didError) {
+    log('error', `Swift run failed: ${result.error ?? 'Unknown error'}`);
     return;
   }
 
-  if (params.parseAsLibrary) {
-    swiftArgs.push('-Xswiftc', '-parse-as-library');
+  if (params.background) {
+    const processId = getProcessId(result);
+    if (processId !== undefined) {
+      ctx.nextStepParams = { swift_package_stop: { pid: processId } };
+    }
   }
+}
 
-  if (params.executableName) {
-    swiftArgs.push(params.executableName);
-  }
+function getProcessId(result: SwiftPackageRunResult): number | undefined {
+  return 'processId' in result.artifacts ? result.artifacts.processId : undefined;
+}
 
-  if (params.arguments && params.arguments.length > 0) {
-    swiftArgs.push('--');
-    swiftArgs.push(...params.arguments);
-  }
+function setStructuredOutput(ctx: ToolHandlerContext, result: SwiftPackageRunResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: STRUCTURED_OUTPUT_SCHEMA,
+    schemaVersion: '1',
+  };
+}
 
-  log('info', `Running swift ${swiftArgs.join(' ')}`);
+export function createSwiftPackageRunExecutor(
+  executor: CommandExecutor,
+  request?: BuildInvocationRequest,
+): StreamingExecutor<SwiftPackageRunParams, SwiftPackageRunResult> {
+  return async (params, ctx) => {
+    const resolvedPath = path.resolve(params.packagePath);
+    const resolvedRequest =
+      request ??
+      createRunSpmInvocationRequest(
+        resolvedPath,
+        params.executableName ?? path.basename(resolvedPath),
+      );
+    const started = createDomainStreamingPipeline('build_run_spm', 'BUILD', ctx);
+    const timeout = Math.min(params.timeout ?? 30, 300) * 1000;
+    const swiftArgs = ['run', '--package-path', resolvedPath];
+    const executableName = params.executableName ?? path.basename(resolvedPath);
 
-  return withErrorHandling(
-    ctx,
-    async () => {
+    if (params.configuration?.toLowerCase() === 'release') {
+      swiftArgs.push('-c', 'release');
+    } else if (params.configuration && params.configuration.toLowerCase() !== 'debug') {
+      return createBuildRunDomainResult({
+        started,
+        succeeded: false,
+        target: 'swift-package',
+        artifacts: {
+          packagePath: resolvedPath,
+        },
+        fallbackErrorMessages: ["Invalid configuration. Use 'debug' or 'release'."],
+        request: resolvedRequest,
+      });
+    }
+
+    if (params.parseAsLibrary) {
+      swiftArgs.push('-Xswiftc', '-parse-as-library');
+    }
+
+    if (params.executableName) {
+      swiftArgs.push(params.executableName);
+    }
+
+    if (params.arguments && params.arguments.length > 0) {
+      swiftArgs.push('--');
+      swiftArgs.push(...params.arguments);
+    }
+
+    log('info', `Running swift ${swiftArgs.join(' ')}`);
+
+    try {
       if (params.background) {
         const command = ['swift', ...swiftArgs];
         const cleanEnv = Object.fromEntries(
@@ -124,9 +188,29 @@ export async function swift_package_runLogic(
           command,
           'Swift Package Run (Background)',
           false,
-          cleanEnv,
+          { env: cleanEnv },
           true,
         );
+        const executablePath = await resolveExecutablePath(
+          executor,
+          resolvedPath,
+          executableName,
+          params.configuration,
+        );
+
+        if (!result.success) {
+          return createBuildRunDomainResult({
+            started,
+            succeeded: false,
+            target: 'swift-package',
+            artifacts: {
+              packagePath: resolvedPath,
+              buildLogPath: started.pipeline.logPath,
+            },
+            fallbackErrorMessages: [result.error ?? result.output ?? 'Unknown error'],
+            request: resolvedRequest,
+          });
+        }
 
         if (result.process?.pid) {
           addProcess(result.process.pid, {
@@ -149,48 +233,53 @@ export async function swift_package_runLogic(
             releaseActivity: acquireDaemonActivity('swift-package.background-process'),
           });
 
-          ctx.emit(headerEvent);
-          ctx.emit(
-            statusLine('success', `Started executable in background (PID: ${result.process.pid})`),
-          );
-          ctx.emit(
-            section('Next Steps', [
-              `Use swift_package_stop with PID ${result.process.pid} to terminate when needed.`,
-            ]),
-          );
-          return;
+          return createBuildRunDomainResult({
+            started,
+            succeeded: true,
+            target: 'swift-package',
+            artifacts: {
+              packagePath: resolvedPath,
+              ...(executablePath ? { executablePath } : {}),
+              processId: result.process.pid,
+              buildLogPath: started.pipeline.logPath,
+            },
+            output: { stdout: [], stderr: [] },
+            request: resolvedRequest,
+          });
         }
 
-        ctx.emit(headerEvent);
-        ctx.emit(statusLine('success', 'Started executable in background'));
-        ctx.emit(section('Next Steps', ['PID not available for this execution.']));
-        return;
+        return createBuildRunDomainResult({
+          started,
+          succeeded: true,
+          target: 'swift-package',
+          artifacts: {
+            packagePath: resolvedPath,
+            ...(executablePath ? { executablePath } : {}),
+            buildLogPath: started.pipeline.logPath,
+          },
+          output: { stdout: [], stderr: [] },
+          request: resolvedRequest,
+        });
       }
 
       const command = ['swift', ...swiftArgs];
-
-      const pipeline = createXcodebuildPipeline({
-        operation: 'BUILD',
-        toolName: 'build_run_spm',
-        params: {},
-        emit: ctx.emit,
-      });
-
-      pipeline.emitEvent(headerEvent);
-      const started: StartedPipeline = { pipeline, startedAt: Date.now() };
-
       const stdoutChunks: string[] = [];
+      const stderrChunks: string[] = [];
 
+      let timeoutHandle: NodeJS.Timeout | undefined;
       const commandPromise = executor(command, 'Swift Package Run', false, {
         onStdout: (chunk: string) => {
           stdoutChunks.push(chunk);
-          pipeline.onStdout(chunk);
+          started.pipeline.onStdout(chunk);
         },
-        onStderr: (chunk: string) => pipeline.onStderr(chunk),
+        onStderr: (chunk: string) => {
+          stderrChunks.push(chunk);
+          started.pipeline.onStderr(chunk);
+        },
       });
 
       const timeoutPromise = new Promise<SwiftPackageRunTimeoutResult>((resolve) => {
-        setTimeout(() => {
+        timeoutHandle = setTimeout(() => {
           resolve({
             success: false,
             output: '',
@@ -201,66 +290,86 @@ export async function swift_package_runLogic(
       });
 
       const result = await Promise.race([commandPromise, timeoutPromise]);
-
-      if (isTimedOutResult(result)) {
-        const timeoutSeconds = timeout / 1000;
-        ctx.emit(headerEvent);
-        ctx.emit(statusLine('warning', `Process timed out after ${timeoutSeconds} seconds.`));
-        ctx.emit(
-          section('Details', [
-            'Process execution exceeded the timeout limit. Consider using background mode for long-running executables.',
-            result.output || '(no output so far)',
-          ]),
-        );
-        return;
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
       }
 
-      const capturedOutput = stdoutChunks.join('').trim();
-      const resolvedExecutableName = params.executableName ?? path.basename(resolvedPath);
+      if (isTimedOutResult(result)) {
+        return createBuildRunDomainResult({
+          started,
+          succeeded: false,
+          target: 'swift-package',
+          artifacts: {
+            packagePath: resolvedPath,
+            buildLogPath: started.pipeline.logPath,
+          },
+          fallbackErrorMessages: [result.error],
+          request: resolvedRequest,
+        });
+      }
+
       const executablePath = await resolveExecutablePath(
         executor,
         resolvedPath,
-        resolvedExecutableName,
+        executableName,
         params.configuration,
       );
-      const processId = result.process?.pid;
-      const buildRunEvents =
-        result.success && executablePath
-          ? createBuildRunResultEvents({
-              scheme: resolvedExecutableName,
-              platform: 'Swift Package',
-              target: resolvedExecutableName,
-              appPath: executablePath,
-              processId,
-              buildLogPath: pipeline.logPath,
-              launchState: 'requested',
-            })
-          : [];
-      const tailEvents = [
-        ...buildRunEvents,
-        ...(result.success && !executablePath
-          ? [detailTree([{ label: 'Build Logs', value: displayPath(pipeline.logPath) }])]
-          : []),
-        ...(capturedOutput ? [section('Output', [capturedOutput])] : []),
-      ];
 
-      finalizeInlineXcodebuild({
+      if (!result.success) {
+        return createBuildRunDomainResult({
+          started,
+          succeeded: false,
+          target: 'swift-package',
+          artifacts: {
+            packagePath: resolvedPath,
+            buildLogPath: started.pipeline.logPath,
+          },
+          fallbackErrorMessages: [result.error ?? result.output ?? 'Unknown error'],
+          request: resolvedRequest,
+        });
+      }
+
+      const stdout = stdoutChunks
+        .join('')
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter((line) => line.length > 0);
+      const stderr = stderrChunks
+        .join('')
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter((line) => line.length > 0);
+
+      return createBuildRunDomainResult({
         started,
-        emit: ctx.emit,
-        succeeded: result.success,
-        durationMs: Date.now() - started.startedAt,
-        tailEvents,
-        emitSummary: true,
-        errorFallbackPolicy: 'if-no-structured-diagnostics',
-        includeBuildLogFileRef: false,
+        succeeded: true,
+        target: 'swift-package',
+        artifacts: {
+          packagePath: resolvedPath,
+          ...(executablePath ? { executablePath } : {}),
+          ...(result.process?.pid ? { processId: result.process.pid } : {}),
+          buildLogPath: started.pipeline.logPath,
+        },
+        output: {
+          stdout,
+          stderr,
+        },
+        request: resolvedRequest,
       });
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to execute swift run: ${message}`,
-      logMessage: ({ message }) => `Swift run failed: ${message}`,
-    },
-  );
+    } catch (error) {
+      return createBuildRunDomainResult({
+        started,
+        succeeded: false,
+        target: 'swift-package',
+        artifacts: {
+          packagePath: resolvedPath,
+          buildLogPath: started.pipeline.logPath,
+        },
+        fallbackErrorMessages: [toErrorMessage(error)],
+        request: resolvedRequest,
+      });
+    }
+  };
 }
 
 export const schema = getSessionAwareToolSchemaShape({

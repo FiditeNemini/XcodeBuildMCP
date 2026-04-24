@@ -1,17 +1,17 @@
 import * as z from 'zod';
 import { join, dirname, basename } from 'node:path';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import { ValidationError } from '../../../utils/errors.ts';
 import { TemplateManager } from '../../../utils/template/index.ts';
 import type { CommandExecutor } from '../../../utils/command.ts';
 import { getDefaultCommandExecutor, getDefaultFileSystemExecutor } from '../../../utils/command.ts';
 import type { FileSystemExecutor } from '../../../utils/FileSystemExecutor.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
 import {
   createTypedToolWithContext,
   getHandlerContext,
 } from '../../../utils/typed-tool-factory.ts';
+import { createScaffoldDomainResult, setScaffoldStructuredOutput } from './domain-result.ts';
 
 const BaseScaffoldSchema = z.object({
   projectName: z.string().min(1),
@@ -315,6 +315,37 @@ async function scaffoldProject(
   }
 }
 
+type ScaffoldMacOSProjectResult = ReturnType<typeof createScaffoldDomainResult>;
+
+export function createScaffoldMacOSProjectExecutor(
+  commandExecutor: CommandExecutor,
+  fileSystemExecutor: FileSystemExecutor,
+): NonStreamingExecutor<ScaffoldMacOSProjectParams, ScaffoldMacOSProjectResult> {
+  return async (params) => {
+    try {
+      const projectParams = { ...params, platform: 'macOS' as const };
+      const projectPath = await scaffoldProject(projectParams, commandExecutor, fileSystemExecutor);
+      const generatedProjectName =
+        params.customizeNames === false ? 'MyProject' : params.projectName;
+      return createScaffoldDomainResult({
+        platform: 'macOS',
+        didError: false,
+        projectName: params.projectName,
+        outputPath: projectPath,
+        workspacePath: `${projectPath}/${generatedProjectName}.xcworkspace`,
+      });
+    } catch (error) {
+      return createScaffoldDomainResult({
+        platform: 'macOS',
+        didError: true,
+        error: error instanceof Error ? error.message : String(error),
+        projectName: params.projectName,
+        outputPath: params.outputPath,
+      });
+    }
+  };
+}
+
 /**
  * Business logic for scaffolding macOS projects
  * Extracted for testability and Separation of Concerns
@@ -325,46 +356,34 @@ export async function scaffold_macos_projectLogic(
   fileSystemExecutor: FileSystemExecutor = getDefaultFileSystemExecutor(),
 ): Promise<void> {
   const ctx = getHandlerContext();
-
-  return withErrorHandling(
-    ctx,
-    async () => {
-      const projectParams = { ...params, platform: 'macOS' as const };
-      const projectPath = await scaffoldProject(projectParams, commandExecutor, fileSystemExecutor);
-
-      const generatedProjectName =
-        params.customizeNames === false ? 'MyProject' : params.projectName;
-      const workspacePath = `${projectPath}/${generatedProjectName}.xcworkspace`;
-
-      ctx.emit(
-        header('Scaffold macOS Project', [
-          { label: 'Name', value: params.projectName },
-          { label: 'Path', value: projectPath },
-          { label: 'Platform', value: 'macOS' },
-        ]),
-      );
-      ctx.emit(statusLine('success', `Project scaffolded successfully\n  └ ${projectPath}`));
-      ctx.nextStepParams = {
-        build_macos: {
-          workspacePath,
-          scheme: generatedProjectName,
-        },
-        build_run_macos: {
-          workspacePath,
-          scheme: generatedProjectName,
-        },
-      };
-    },
-    {
-      header: header('Scaffold macOS Project', [
-        { label: 'Name', value: params.projectName },
-        { label: 'Path', value: params.outputPath },
-        { label: 'Platform', value: 'macOS' },
-      ]),
-      errorMessage: ({ message }) => message,
-      logMessage: ({ message }) => `Failed to scaffold macOS project: ${message}`,
-    },
+  const executeScaffoldMacOSProject = createScaffoldMacOSProjectExecutor(
+    commandExecutor,
+    fileSystemExecutor,
   );
+  const result = await executeScaffoldMacOSProject(params);
+
+  setScaffoldStructuredOutput(ctx, result);
+
+  if (result.didError) {
+    log('error', `Failed to scaffold macOS project: ${result.error ?? 'Unknown error'}`);
+    return;
+  }
+
+  const generatedProjectName = params.customizeNames === false ? 'MyProject' : params.projectName;
+  ctx.nextStepParams = {
+    build_macos: {
+      workspacePath:
+        result.artifacts.workspacePath ??
+        `${result.artifacts.outputPath}/${generatedProjectName}.xcworkspace`,
+      scheme: generatedProjectName,
+    },
+    build_run_macos: {
+      workspacePath:
+        result.artifacts.workspacePath ??
+        `${result.artifacts.outputPath}/${generatedProjectName}.xcworkspace`,
+      scheme: generatedProjectName,
+    },
+  };
 }
 
 export const schema = ScaffoldmacOSProjectSchema.shape;

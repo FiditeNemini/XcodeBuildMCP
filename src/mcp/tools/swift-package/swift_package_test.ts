@@ -1,5 +1,8 @@
 import * as z from 'zod';
 import path from 'node:path';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { TestResultDomainResult } from '../../../types/domain-results.ts';
+import type { StreamingExecutor } from '../../../types/tool-execution.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
 import { log } from '../../../utils/logging/index.ts';
@@ -8,11 +11,16 @@ import {
   getSessionAwareToolSchemaShape,
   getHandlerContext,
 } from '../../../utils/typed-tool-factory.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
-import { startBuildPipeline } from '../../../utils/xcodebuild-pipeline.ts';
-import { finalizeInlineXcodebuild } from '../../../utils/xcodebuild-output.ts';
-import { displayPath } from '../../../utils/build-preflight.ts';
+import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
+import type { BuildInvocationRequest } from '../../../types/domain-fragments.ts';
+import {
+  createStreamingExecutionContext,
+  createDomainStreamingPipeline,
+  createTestDomainResult,
+} from '../../../utils/xcodebuild-domain-results.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+
+const STRUCTURED_OUTPUT_SCHEMA = 'xcodebuildmcp.output.test-result';
 
 const baseSchemaObject = z.object({
   packagePath: z.string(),
@@ -31,6 +39,118 @@ const publicSchemaObject = baseSchemaObject.omit({
 const swiftPackageTestSchema = baseSchemaObject;
 
 type SwiftPackageTestParams = z.infer<typeof swiftPackageTestSchema>;
+type SwiftPackageTestResult = TestResultDomainResult;
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: SwiftPackageTestResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: STRUCTURED_OUTPUT_SCHEMA,
+    schemaVersion: '1',
+  };
+}
+
+function createTestSpmInvocationRequest(
+  resolvedPath: string,
+  params: SwiftPackageTestParams,
+): BuildInvocationRequest {
+  return {
+    scheme: path.basename(resolvedPath),
+    configuration: (params.configuration ?? 'debug').toLowerCase(),
+    platform: 'Swift Package',
+    target: 'swift-package' as const,
+  };
+}
+
+function getFallbackErrorMessages(
+  started: ReturnType<typeof createDomainStreamingPipeline>,
+  extraMessages: string[] = [],
+): string[] {
+  return [...started.stderrLines, ...extraMessages];
+}
+
+export function createSwiftPackageTestExecutor(
+  executor: CommandExecutor,
+  request?: BuildInvocationRequest,
+): StreamingExecutor<SwiftPackageTestParams, SwiftPackageTestResult> {
+  return async (params, ctx) => {
+    const resolvedPath = path.resolve(params.packagePath);
+    const resolvedRequest = request ?? createTestSpmInvocationRequest(resolvedPath, params);
+    const swiftArgs = ['test', '--package-path', resolvedPath];
+    const started = createDomainStreamingPipeline('swift_package_test', 'TEST', ctx, 'test-result');
+
+    if (params.configuration?.toLowerCase() === 'release') {
+      swiftArgs.push('-c', 'release');
+    } else if (params.configuration && params.configuration.toLowerCase() !== 'debug') {
+      return createTestDomainResult({
+        started,
+        succeeded: false,
+        target: 'swift-package',
+        artifacts: {
+          buildLogPath: started.pipeline.logPath,
+        },
+        fallbackErrorMessages: ["Invalid configuration. Use 'debug' or 'release'."],
+        request: resolvedRequest,
+      });
+    }
+
+    if (params.testProduct) {
+      swiftArgs.push('--test-product', params.testProduct);
+    }
+
+    if (params.filter) {
+      swiftArgs.push('--filter', params.filter);
+    }
+
+    if (params.parallel === false) {
+      swiftArgs.push('--no-parallel');
+    }
+
+    if (params.showCodecov) {
+      swiftArgs.push('--show-code-coverage');
+    }
+
+    if (params.parseAsLibrary) {
+      swiftArgs.push('-Xswiftc', '-parse-as-library');
+    }
+
+    log('info', `Running swift ${swiftArgs.join(' ')}`);
+
+    try {
+      const result = await executor(['swift', ...swiftArgs], 'Swift Package Test', false, {
+        onStdout: (chunk: string) => started.pipeline.onStdout(chunk),
+        onStderr: (chunk: string) => started.pipeline.onStderr(chunk),
+      });
+
+      const failureMessage = result.error || result.output || 'Unknown error';
+      const shouldIncludePackagePath = /chdir error/i.test(failureMessage);
+
+      return createTestDomainResult({
+        started,
+        succeeded: result.success,
+        target: 'swift-package',
+        artifacts: {
+          buildLogPath: started.pipeline.logPath,
+          ...(result.success || !shouldIncludePackagePath ? {} : { packagePath: resolvedPath }),
+        },
+        fallbackErrorMessages: getFallbackErrorMessages(started, [failureMessage]),
+        request: resolvedRequest,
+      });
+    } catch (error) {
+      const message = toErrorMessage(error);
+      return createTestDomainResult({
+        started,
+        succeeded: false,
+        target: 'swift-package',
+        artifacts: {
+          buildLogPath: started.pipeline.logPath,
+          packagePath: resolvedPath,
+        },
+        fallbackErrorMessages: getFallbackErrorMessages(started, [message]),
+        request: resolvedRequest,
+      });
+    }
+  };
+}
 
 export async function swift_package_testLogic(
   params: SwiftPackageTestParams,
@@ -38,86 +158,14 @@ export async function swift_package_testLogic(
 ): Promise<void> {
   const ctx = getHandlerContext();
   const resolvedPath = path.resolve(params.packagePath);
-  const swiftArgs = ['test', '--package-path', resolvedPath];
 
-  const headerEvent = header('Swift Package Test', [
-    { label: 'Package', value: resolvedPath },
-    ...(params.testProduct ? [{ label: 'Test Product', value: params.testProduct }] : []),
-    ...(params.configuration ? [{ label: 'Configuration', value: params.configuration }] : []),
-  ]);
+  const invocationRequest = createTestSpmInvocationRequest(resolvedPath, params);
+  ctx.emit(createBuildInvocationFragment('test-result', 'TEST', invocationRequest));
+  const executionContext = createStreamingExecutionContext(ctx);
+  const executeSwiftPackageTest = createSwiftPackageTestExecutor(executor, invocationRequest);
+  const result = await executeSwiftPackageTest(params, executionContext);
 
-  if (params.configuration?.toLowerCase() === 'release') {
-    swiftArgs.push('-c', 'release');
-  } else if (params.configuration && params.configuration.toLowerCase() !== 'debug') {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', "Invalid configuration. Use 'debug' or 'release'."));
-    return;
-  }
-
-  if (params.testProduct) {
-    swiftArgs.push('--test-product', params.testProduct);
-  }
-
-  if (params.filter) {
-    swiftArgs.push('--filter', params.filter);
-  }
-
-  if (params.parallel === false) {
-    swiftArgs.push('--no-parallel');
-  }
-
-  if (params.showCodecov) {
-    swiftArgs.push('--show-code-coverage');
-  }
-
-  if (params.parseAsLibrary) {
-    swiftArgs.push('-Xswiftc', '-parse-as-library');
-  }
-
-  log('info', `Running swift ${swiftArgs.join(' ')}`);
-
-  const configText = `Swift Package Test\n  Package: ${displayPath(resolvedPath)}`;
-  const started = startBuildPipeline({
-    operation: 'TEST',
-    toolName: 'swift_package_test',
-    params: {
-      scheme: params.testProduct ?? path.basename(resolvedPath),
-      configuration: params.configuration ?? 'debug',
-      platform: 'Swift Package',
-      preflight: configText,
-    },
-    message: configText,
-  });
-
-  const { pipeline } = started;
-
-  return withErrorHandling(
-    ctx,
-    async () => {
-      const result = await executor(['swift', ...swiftArgs], 'Swift Package Test', false, {
-        onStdout: (chunk: string) => pipeline.onStdout(chunk),
-        onStderr: (chunk: string) => pipeline.onStderr(chunk),
-      });
-
-      finalizeInlineXcodebuild({
-        started,
-        emit: ctx.emit,
-        succeeded: result.success,
-        durationMs: Date.now() - started.startedAt,
-      });
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Failed to execute swift test: ${message}`,
-      logMessage: ({ message }) => `Swift package test failed: ${message}`,
-      mapError: ({ message, headerEvent: hdr, emit }) => {
-        if (emit) {
-          emit(hdr);
-          emit(statusLine('error', `Failed to execute swift test: ${message}`));
-        }
-      },
-    },
-  );
+  setStructuredOutput(ctx, result);
 }
 
 export const schema = getSessionAwareToolSchemaShape({

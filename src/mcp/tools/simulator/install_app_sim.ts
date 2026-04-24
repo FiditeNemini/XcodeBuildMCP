@@ -1,4 +1,6 @@
 import * as z from 'zod';
+import type { InstallResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import { log } from '../../../utils/logging/index.ts';
 import { validateFileExists } from '../../../utils/validation.ts';
 import type { CommandExecutor, FileSystemExecutor } from '../../../utils/execution/index.ts';
@@ -7,11 +9,15 @@ import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
-import { displayPath } from '../../../utils/build-preflight.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
 import { installAppOnSimulator } from '../../../utils/simulator-steps.ts';
+import {
+  buildInstallFailure,
+  buildInstallSuccess,
+  setInstallResultStructuredOutput,
+} from '../../../utils/app-lifecycle-results.ts';
 
 const baseSchemaObject = z.object({
   simulatorId: z
@@ -49,29 +55,67 @@ export async function install_app_simLogic(
   executor: CommandExecutor,
   fileSystem?: FileSystemExecutor,
 ): Promise<void> {
-  const simulatorDisplayName = params.simulatorName
-    ? `"${params.simulatorName}" (${params.simulatorId})`
-    : params.simulatorId;
-
-  const headerEvent = header('Install App', [
-    { label: 'Simulator', value: simulatorDisplayName },
-    { label: 'App Path', value: displayPath(params.appPath) },
-  ]);
-
   const ctx = getHandlerContext();
+  const executeInstallAppSim = createInstallAppSimExecutor(executor, fileSystem);
+  const result = await executeInstallAppSim(params);
 
-  const appPathExistsValidation = validateFileExists(params.appPath, fileSystem);
-  if (!appPathExistsValidation.isValid) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', appPathExistsValidation.errorMessage!));
+  setInstallResultStructuredOutput(ctx, result);
+
+  if (result.didError) {
+    log(
+      'error',
+      `Error during install app in simulator operation: ${result.error ?? 'Unknown error'}`,
+    );
     return;
   }
 
-  log('info', `Starting xcrun simctl install request for simulator ${params.simulatorId}`);
+  const bundleId = await extractBundleId(params.appPath, executor);
+  ctx.nextStepParams = {
+    open_sim: {},
+    launch_app_sim: {
+      simulatorId: params.simulatorId,
+      bundleId: bundleId || 'YOUR_APP_BUNDLE_ID',
+    },
+  };
+}
 
-  return withErrorHandling(
-    ctx,
-    async () => {
+async function extractBundleId(
+  appPath: string,
+  executor: CommandExecutor,
+): Promise<string | undefined> {
+  try {
+    const bundleIdResult = await executor(
+      ['defaults', 'read', `${appPath}/Info`, 'CFBundleIdentifier'],
+      'Extract Bundle ID',
+      false,
+    );
+    if (bundleIdResult.success) {
+      const bundleId = bundleIdResult.output.trim();
+      return bundleId.length > 0 ? bundleId : undefined;
+    }
+  } catch (error) {
+    log('warn', `Could not extract bundle ID from app: ${toErrorMessage(error)}`);
+  }
+
+  return undefined;
+}
+
+export function createInstallAppSimExecutor(
+  executor: CommandExecutor,
+  fileSystem?: FileSystemExecutor,
+): NonStreamingExecutor<InstallAppSimParams, InstallResultDomainResult> {
+  return async (params) => {
+    const artifacts = { simulatorId: params.simulatorId, appPath: params.appPath };
+
+    const appPathExistsValidation = validateFileExists(params.appPath, fileSystem);
+    if (!appPathExistsValidation.isValid) {
+      const message = appPathExistsValidation.errorMessage ?? `File not found: '${params.appPath}'`;
+      return buildInstallFailure(artifacts, message);
+    }
+
+    log('info', `Starting xcrun simctl install request for simulator ${params.simulatorId}`);
+
+    try {
       const installResult = await installAppOnSimulator(
         params.simulatorId,
         params.appPath,
@@ -79,43 +123,20 @@ export async function install_app_simLogic(
       );
 
       if (!installResult.success) {
-        ctx.emit(headerEvent);
-        ctx.emit(
-          statusLine('error', `Install app in simulator operation failed: ${installResult.error}`),
+        return buildInstallFailure(
+          artifacts,
+          `Install app in simulator operation failed: ${installResult.error}`,
         );
-        return;
       }
 
-      let bundleId = '';
-      try {
-        const bundleIdResult = await executor(
-          ['defaults', 'read', `${params.appPath}/Info`, 'CFBundleIdentifier'],
-          'Extract Bundle ID',
-          false,
-        );
-        if (bundleIdResult.success) {
-          bundleId = bundleIdResult.output.trim();
-        }
-      } catch (error) {
-        log('warn', `Could not extract bundle ID from app: ${error}`);
-      }
-
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('success', 'App installed successfully'));
-      ctx.nextStepParams = {
-        open_sim: {},
-        launch_app_sim: {
-          simulatorId: params.simulatorId,
-          bundleId: bundleId || 'YOUR_APP_BUNDLE_ID',
-        },
-      };
-    },
-    {
-      header: headerEvent,
-      errorMessage: ({ message }) => `Install app in simulator operation failed: ${message}`,
-      logMessage: ({ message }) => `Error during install app in simulator operation: ${message}`,
-    },
-  );
+      return buildInstallSuccess(artifacts);
+    } catch (error) {
+      return buildInstallFailure(
+        artifacts,
+        `Install app in simulator operation failed: ${toErrorMessage(error)}`,
+      );
+    }
+  };
 }
 
 export const schema = getSessionAwareToolSchemaShape({
@@ -124,7 +145,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<InstallAppSimParams>({
-  internalSchema: internalSchemaObject as unknown as z.ZodType<InstallAppSimParams, unknown>,
+  internalSchema: toInternalSchema<InstallAppSimParams>(internalSchemaObject),
   logicFunction: install_app_simLogic,
   getExecutor: getDefaultCommandExecutor,
   requirements: [

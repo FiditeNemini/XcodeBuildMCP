@@ -9,8 +9,13 @@ import {
   __setTestFileSystemExecutorOverride,
   __clearTestExecutorOverrides,
 } from '../../../../utils/execution/index.ts';
-import { schema, handler, get_file_coverageLogic } from '../get_file_coverage.ts';
-import { allText, runLogic } from '../../../../test-utils/test-helpers.ts';
+import {
+  schema,
+  handler,
+  get_file_coverageLogic,
+  createGetFileCoverageExecutor,
+} from '../get_file_coverage.ts';
+import { allText, runLogic, runToolLogic } from '../../../../test-utils/test-helpers.ts';
 
 
 
@@ -350,13 +355,16 @@ describe('get_file_coverage', () => {
         return createMockCommandResponse({ success: true, output: sampleArchiveOutput, exitCode: 0 });
       };
 
-      const result = await runLogic(() => get_file_coverageLogic(
-        { xcresultPath: '/tmp/test.xcresult', file: 'ViewModel.swift', showLines: true },
-        { executor: mockExecutor, fileSystem: mockFileSystem },
-      ));
+      const { result } = await runToolLogic(() =>
+        get_file_coverageLogic(
+          { xcresultPath: '/tmp/test.xcresult', file: 'ViewModel.swift', showLines: true },
+          { executor: mockExecutor, fileSystem: mockFileSystem },
+        ),
+      );
 
-      const text = allText(result);
-      expect(text).toContain('Uncovered line ranges (/src/MyApp/ViewModel.swift)');
+      expect(result.events).toHaveLength(0);
+      const text = result.text();
+      expect(text).toContain('Uncovered Lines');
       expect(text).toContain('L4-6');
       expect(text).toContain('L9');
     });
@@ -416,14 +424,17 @@ describe('get_file_coverage', () => {
         });
       };
 
-      const result = await runLogic(() => get_file_coverageLogic(
-        { xcresultPath: '/tmp/test.xcresult', file: 'ViewModel.swift', showLines: true },
-        { executor: mockExecutor, fileSystem: mockFileSystem },
-      ));
+      const result = await runLogic(() =>
+        get_file_coverageLogic(
+          { xcresultPath: '/tmp/test.xcresult', file: 'ViewModel.swift', showLines: true },
+          { executor: mockExecutor, fileSystem: mockFileSystem },
+        ),
+      );
 
       expect(result.isError).toBeUndefined();
       const text = allText(result);
-      expect(text).toContain('Could not retrieve line-level coverage from archive');
+      expect(text).toContain('Coverage: 61.9%');
+      expect(text).not.toContain('Uncovered Lines');
     });
   });
 
@@ -460,6 +471,26 @@ describe('get_file_coverage', () => {
       expect(text).toContain('Failed to load result bundle');
     });
 
+    it('keeps command failure summary short and preserves diagnostics', async () => {
+      const mockExecutor = createMockExecutor({
+        success: false,
+        error: 'Failed to load result bundle',
+      });
+      const execute = createGetFileCoverageExecutor({
+        executor: mockExecutor,
+        fileSystem: mockFileSystem,
+      });
+
+      const result = await execute({
+        xcresultPath: '/tmp/bad.xcresult',
+        file: 'Foo.swift',
+        showLines: false,
+      });
+
+      expect(result.error).toBe('Failed to get file coverage.');
+      expect(result.diagnostics?.errors).toEqual([{ message: 'Failed to load result bundle' }]);
+    });
+
     it('should return error when JSON parsing fails', async () => {
       const mockExecutor = createMockExecutor({
         success: true,
@@ -474,6 +505,30 @@ describe('get_file_coverage', () => {
       expect(result.isError).toBe(true);
       const text = allText(result);
       expect(text).toContain('Failed to parse coverage JSON output');
+    });
+
+    it('preserves invalid coverage JSON output as raw diagnostics', async () => {
+      const mockExecutor = createMockExecutor({
+        success: true,
+        output: 'not json',
+      });
+      const execute = createGetFileCoverageExecutor({
+        executor: mockExecutor,
+        fileSystem: mockFileSystem,
+      });
+
+      const result = await execute({
+        xcresultPath: '/tmp/test.xcresult',
+        file: 'Foo.swift',
+        showLines: false,
+      });
+
+      expect(result.error).toBe('Failed to parse coverage JSON output.');
+      expect(result.diagnostics).toEqual({
+        warnings: [],
+        errors: [{ message: 'Failed to parse coverage JSON output.' }],
+        rawOutput: ['not json'],
+      });
     });
 
     it('should return error when no file entries found', async () => {

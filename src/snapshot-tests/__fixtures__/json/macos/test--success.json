@@ -4,6 +4,16 @@
   "didError": false,
   "error": null,
   "data": {
+    "request": {
+      "scheme": "MCPTest",
+      "configuration": "Debug",
+      "platform": "macOS",
+      "onlyTesting": [
+        "MCPTestTests/MCPTestTests/appNameIsCorrect()",
+        "MCPTestTests/MCPTestsXCTests/testAppNameIsCorrect"
+      ],
+      "skipTesting": []
+    },
     "summary": {
       "status": "SUCCEEDED",
       "durationMs": 1234,
@@ -19,7 +29,7 @@
     },
     "tests": {
       "selected": [
-        "MCPTestTests/MCPTestTests/appNameIsCorrect()",
+        "MCPTestTests/MCPTestTests/appNameIsCorrect",
         "MCPTestTests/MCPTestsXCTests/testAppNameIsCorrect"
       ],
       "discovered": {

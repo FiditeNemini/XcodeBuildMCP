@@ -1,4 +1,8 @@
+import { dirname } from 'node:path';
 import * as z from 'zod';
+import type { ToolHandlerContext } from '../../../rendering/types.ts';
+import type { CaptureResultDomainResult } from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import {
   getDefaultCommandExecutor,
   getDefaultFileSystemExecutor,
@@ -17,9 +21,9 @@ import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
-import { dirname } from 'path';
-import { header, statusLine, detailTree, section } from '../../../utils/tool-event-builders.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
 
 // Base schema object (used for MCP schema exposure)
 const recordSimVideoSchemaObject = z.object({
@@ -52,6 +56,164 @@ const recordSimVideoSchema = recordSimVideoSchemaObject
   });
 
 type RecordSimVideoParams = z.infer<typeof recordSimVideoSchema>;
+type RecordSimVideoResult = CaptureResultDomainResult;
+type VideoRecordingCapture = {
+  type: 'video-recording';
+  state: 'started' | 'stopped';
+  fps?: number;
+  outputFile?: string;
+  sessionId?: string;
+};
+
+function createRecordSimVideoResult(params: {
+  simulatorId: string;
+  didError: boolean;
+  error?: string;
+  diagnosticsMessage?: string;
+  capture?: VideoRecordingCapture;
+}): RecordSimVideoResult {
+  return {
+    kind: 'capture-result',
+    didError: params.didError,
+    error: params.error ?? null,
+    summary: {
+      status: params.didError ? 'FAILED' : 'SUCCEEDED',
+    },
+    artifacts: {
+      simulatorId: params.simulatorId,
+    },
+    ...(params.capture ? { capture: params.capture } : {}),
+    ...(params.diagnosticsMessage
+      ? { diagnostics: createBasicDiagnostics({ errors: [params.diagnosticsMessage] }) }
+      : {}),
+  } as RecordSimVideoResult;
+}
+
+function setStructuredOutput(ctx: ToolHandlerContext, result: RecordSimVideoResult): void {
+  ctx.structuredOutput = {
+    result,
+    schema: 'xcodebuildmcp.output.capture-result',
+    schemaVersion: '1',
+  };
+}
+
+export function createRecordSimVideoExecutor(
+  executor: CommandExecutor,
+  axe: {
+    areAxeToolsAvailable(): boolean;
+    isAxeAtLeastVersion(v: string, e: CommandExecutor): Promise<boolean>;
+  },
+  video: {
+    startSimulatorVideoCapture: typeof startSimulatorVideoCapture;
+    stopSimulatorVideoCapture: typeof stopSimulatorVideoCapture;
+  },
+  fs: FileSystemExecutor,
+): NonStreamingExecutor<RecordSimVideoParams, RecordSimVideoResult> {
+  return async (params) => {
+    if (!axe.areAxeToolsAvailable()) {
+      return createRecordSimVideoResult({
+        simulatorId: params.simulatorId,
+        didError: true,
+        error: AXE_NOT_AVAILABLE_MESSAGE,
+        diagnosticsMessage: AXE_NOT_AVAILABLE_MESSAGE,
+      });
+    }
+
+    const hasVersion = await axe.isAxeAtLeastVersion('1.1.0', executor);
+    if (!hasVersion) {
+      const message =
+        'AXe v1.1.0 or newer is required for simulator video capture. Please update bundled AXe artifacts.';
+      return createRecordSimVideoResult({
+        simulatorId: params.simulatorId,
+        didError: true,
+        error: message,
+        diagnosticsMessage: message,
+      });
+    }
+
+    if (params.start) {
+      const fpsUsed = params.fps ?? 30;
+      const startRes = await video.startSimulatorVideoCapture(
+        { simulatorUuid: params.simulatorId, fps: fpsUsed },
+        executor,
+      );
+
+      if (!startRes.started) {
+        return createRecordSimVideoResult({
+          simulatorId: params.simulatorId,
+          didError: true,
+          error: 'Failed to start video recording.',
+          diagnosticsMessage: startRes.error ?? 'Unknown error',
+        });
+      }
+
+      return createRecordSimVideoResult({
+        simulatorId: params.simulatorId,
+        didError: false,
+        capture: {
+          type: 'video-recording',
+          state: 'started',
+          fps: fpsUsed,
+          sessionId: startRes.sessionId,
+        },
+      });
+    }
+
+    const stopRes = await video.stopSimulatorVideoCapture(
+      { simulatorUuid: params.simulatorId },
+      executor,
+    );
+
+    if (!stopRes.stopped) {
+      return createRecordSimVideoResult({
+        simulatorId: params.simulatorId,
+        didError: true,
+        error: 'Failed to stop video recording.',
+        diagnosticsMessage: stopRes.error ?? 'Unknown error',
+      });
+    }
+
+    try {
+      if (params.outputFile) {
+        if (!stopRes.parsedPath) {
+          const diagnosticMessage = `Recording stopped but could not determine the recorded file path from AXe output. Raw output: ${stopRes.stdout ?? '(no output captured)'}`;
+          return createRecordSimVideoResult({
+            simulatorId: params.simulatorId,
+            didError: true,
+            error: 'Recording stopped but could not determine the recorded file path.',
+            diagnosticsMessage: diagnosticMessage,
+          });
+        }
+
+        await fs.mkdir(dirname(params.outputFile), { recursive: true });
+        await fs.cp(stopRes.parsedPath, params.outputFile);
+        try {
+          await fs.rm(stopRes.parsedPath, { recursive: false });
+        } catch {
+          // Ignore cleanup failure
+        }
+      }
+    } catch (error) {
+      const diagnosticMessage = error instanceof Error ? error.message : String(error);
+      return createRecordSimVideoResult({
+        simulatorId: params.simulatorId,
+        didError: true,
+        error: 'Recording stopped but failed to save the video file.',
+        diagnosticsMessage: diagnosticMessage,
+      });
+    }
+
+    return createRecordSimVideoResult({
+      simulatorId: params.simulatorId,
+      didError: false,
+      capture: {
+        type: 'video-recording',
+        state: 'stopped',
+        outputFile: params.outputFile ?? stopRes.parsedPath,
+      },
+    });
+  };
+}
 
 export async function record_sim_videoLogic(
   params: RecordSimVideoParams,
@@ -73,64 +235,15 @@ export async function record_sim_videoLogic(
   fs: FileSystemExecutor = getDefaultFileSystemExecutor(),
 ): Promise<void> {
   const ctx = getHandlerContext();
-  const headerEvent = header('Record Video', [{ label: 'Simulator', value: params.simulatorId }]);
+  const executeRecordSimVideo = createRecordSimVideoExecutor(executor, axe, video, fs);
+  const result = await executeRecordSimVideo(params);
 
-  if (!axe.areAxeToolsAvailable()) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', AXE_NOT_AVAILABLE_MESSAGE));
-    return;
-  }
-  const hasVersion = await axe.isAxeAtLeastVersion('1.1.0', executor);
-  if (!hasVersion) {
-    ctx.emit(headerEvent);
-    ctx.emit(
-      statusLine(
-        'error',
-        'AXe v1.1.0 or newer is required for simulator video capture. Please update bundled AXe artifacts.',
-      ),
-    );
+  setStructuredOutput(ctx, result);
+  if (result.didError) {
     return;
   }
 
   if (params.start) {
-    const fpsUsed = params.fps ?? 30;
-    const startRes = await video.startSimulatorVideoCapture(
-      { simulatorUuid: params.simulatorId, fps: fpsUsed },
-      executor,
-    );
-
-    if (!startRes.started) {
-      ctx.emit(headerEvent);
-      ctx.emit(statusLine('error', `Failed to start video recording: ${startRes.error}`));
-      return;
-    }
-
-    const notes: string[] = [];
-    if (typeof params.outputFile === 'string' && params.outputFile.length > 0) {
-      notes.push(
-        'Note: outputFile is ignored when start=true; provide it when stopping to move/rename the recorded file.',
-      );
-    }
-    if (startRes.warning) {
-      notes.push(startRes.warning);
-    }
-
-    ctx.emit(headerEvent);
-    ctx.emit(
-      detailTree([
-        { label: 'FPS', value: String(fpsUsed) },
-        { label: 'Session', value: startRes.sessionId },
-      ]),
-    );
-    if (notes.length > 0) {
-      ctx.emit(section('Notes', notes));
-    }
-    ctx.emit(
-      statusLine(
-        'success',
-        `Video recording started for simulator ${params.simulatorId} at ${fpsUsed} fps`,
-      ),
-    );
     ctx.nextStepParams = {
       record_sim_video: {
         simulatorId: params.simulatorId,
@@ -140,67 +253,6 @@ export async function record_sim_videoLogic(
     };
     return;
   }
-
-  // params.stop must be true here per schema
-  const stopRes = await video.stopSimulatorVideoCapture(
-    { simulatorUuid: params.simulatorId },
-    executor,
-  );
-
-  if (!stopRes.stopped) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', `Failed to stop video recording: ${stopRes.error}`));
-    return;
-  }
-
-  const outputs: string[] = [];
-  let finalSavedPath = params.outputFile ?? stopRes.parsedPath ?? '';
-  try {
-    if (params.outputFile) {
-      if (!stopRes.parsedPath) {
-        ctx.emit(headerEvent);
-        ctx.emit(
-          statusLine(
-            'error',
-            `Recording stopped but could not determine the recorded file path from AXe output. Raw output: ${stopRes.stdout ?? '(no output captured)'}`,
-          ),
-        );
-        return;
-      }
-
-      const src = stopRes.parsedPath;
-      const dest = params.outputFile;
-      await fs.mkdir(dirname(dest), { recursive: true });
-      await fs.cp(src, dest);
-      try {
-        await fs.rm(src, { recursive: false });
-      } catch {
-        // Ignore cleanup failure
-      }
-      finalSavedPath = dest;
-
-      outputs.push(`Original file: ${src}`);
-      outputs.push(`Saved to: ${dest}`);
-    } else if (stopRes.parsedPath) {
-      outputs.push(`Saved to: ${stopRes.parsedPath}`);
-      finalSavedPath = stopRes.parsedPath;
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    ctx.emit(headerEvent);
-    ctx.emit(
-      statusLine('error', `Recording stopped but failed to save/move the video file: ${msg}`),
-    );
-    return;
-  }
-
-  ctx.emit(headerEvent);
-  if (outputs.length > 0) {
-    ctx.emit(section('Output', outputs));
-  } else if (stopRes.stdout) {
-    ctx.emit(section('AXe Output', [stopRes.stdout]));
-  }
-  ctx.emit(statusLine('success', `Video recording stopped for simulator ${params.simulatorId}`));
 }
 
 const publicSchemaObject = z.strictObject(
@@ -213,7 +265,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<RecordSimVideoParams>({
-  internalSchema: recordSimVideoSchema as unknown as z.ZodType<RecordSimVideoParams, unknown>,
+  internalSchema: toInternalSchema<RecordSimVideoParams>(recordSimVideoSchema),
   logicFunction: record_sim_videoLogic,
   getExecutor: getDefaultCommandExecutor,
   requirements: [{ allOf: ['simulatorId'], message: 'simulatorId is required' }],

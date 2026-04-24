@@ -1,17 +1,23 @@
 import * as z from 'zod';
-import path from 'node:path';
+import type {
+  BasicDiagnostics,
+  BuildResultArtifacts,
+  ToolDomainResultBase,
+} from '../../../types/domain-results.ts';
+import type { NonStreamingExecutor } from '../../../types/tool-execution.ts';
 import {
   createSessionAwareTool,
   getSessionAwareToolSchemaShape,
   getHandlerContext,
+  toInternalSchema,
 } from '../../../utils/typed-tool-factory.ts';
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { getDefaultCommandExecutor } from '../../../utils/execution/index.ts';
 import { XcodePlatform } from '../../../types/common.ts';
-import { constructDestinationString } from '../../../utils/xcode.ts';
-import { nullifyEmptyStrings } from '../../../utils/schema-helpers.ts';
-import { withErrorHandling } from '../../../utils/tool-error-handling.ts';
-import { header, statusLine } from '../../../utils/tool-event-builders.ts';
+import { executeXcodeBuildCommand } from '../../../utils/build/index.ts';
+import { nullifyEmptyStrings, withProjectOrWorkspace } from '../../../utils/schema-helpers.ts';
+import { toErrorMessage } from '../../../utils/errors.ts';
+import { createBasicDiagnostics } from '../../../utils/diagnostics.ts';
 
 const baseOptions = {
   scheme: z.string().optional().describe('Optional: The scheme to clean'),
@@ -45,20 +51,23 @@ const baseSchemaObject = z.object({
 
 const cleanSchema = z.preprocess(
   nullifyEmptyStrings,
-  baseSchemaObject
-    .refine((val) => val.projectPath !== undefined || val.workspacePath !== undefined, {
-      message: 'Either projectPath or workspacePath is required.',
-    })
-    .refine((val) => !(val.projectPath !== undefined && val.workspacePath !== undefined), {
-      message: 'projectPath and workspacePath are mutually exclusive. Provide only one.',
-    })
-    .refine((val) => !(val.workspacePath && !val.scheme), {
-      message: 'scheme is required when workspacePath is provided.',
-      path: ['scheme'],
-    }),
+  withProjectOrWorkspace(baseSchemaObject).refine((val) => !(val.workspacePath && !val.scheme), {
+    message: 'scheme is required when workspacePath is provided.',
+    path: ['scheme'],
+  }),
 );
 
 export type CleanParams = z.infer<typeof cleanSchema>;
+type CleanResult = ToolDomainResultBase & {
+  kind: 'build-result';
+  summary: {
+    status: 'SUCCEEDED' | 'FAILED';
+  };
+  artifacts: BuildResultArtifacts;
+  diagnostics: BasicDiagnostics;
+};
+
+const STRUCTURED_OUTPUT_SCHEMA = 'xcodebuildmcp.output.build-result';
 
 const PLATFORM_MAP: Record<string, XcodePlatform> = {
   macOS: XcodePlatform.macOS,
@@ -79,98 +88,166 @@ const SIMULATOR_TO_DEVICE_PLATFORM: Partial<Record<XcodePlatform, XcodePlatform>
   [XcodePlatform.visionOSSimulator]: XcodePlatform.visionOS,
 };
 
-export async function cleanLogic(params: CleanParams, executor: CommandExecutor): Promise<void> {
-  const headerEvent = header('Clean');
+function createCleanArtifacts(
+  params: CleanParams,
+  configuration: string,
+  platform: XcodePlatform,
+): CleanResult['artifacts'] {
+  return {
+    ...(params.workspacePath ? { workspacePath: params.workspacePath } : {}),
+    ...(params.scheme ? { scheme: params.scheme } : {}),
+    configuration,
+    platform: String(platform),
+  };
+}
 
-  const ctx = getHandlerContext();
+const STDERR_NOISE_PATTERNS: readonly RegExp[] = [
+  /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\S+\[\d+:\d+\]/u,
+  /^Command line invocation:$/u,
+  /^Build settings from command line:$/u,
+];
 
-  if (params.workspacePath && !params.scheme) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', 'scheme is required when workspacePath is provided.'));
-    return;
+function extractStderrErrorLines(stderrChunks: string[]): string[] {
+  if (stderrChunks.length === 0) {
+    return [];
   }
+  return stderrChunks
+    .join('')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => !STDERR_NOISE_PATTERNS.some((pattern) => pattern.test(line)));
+}
 
+function createCleanResult(
+  params: CleanParams,
+  status: CleanResult['summary']['status'],
+  diagnostics: CleanResult['diagnostics'],
+  error: string | null,
+  options?: {
+    configuration?: string;
+    cleanPlatform?: XcodePlatform;
+  },
+): CleanResult {
+  const cleanPlatform = options?.cleanPlatform ?? resolveCleanPlatform(params) ?? XcodePlatform.iOS;
+  const configuration = options?.configuration ?? params.configuration ?? 'Debug';
+
+  return {
+    kind: 'build-result',
+    didError: status === 'FAILED',
+    error,
+    summary: { status },
+    artifacts: createCleanArtifacts(params, configuration, cleanPlatform),
+    diagnostics,
+  };
+}
+
+function resolveCleanPlatform(params: CleanParams): XcodePlatform | null {
   const targetPlatform = params.platform ?? 'iOS';
-
   const platformEnum = PLATFORM_MAP[targetPlatform];
   if (!platformEnum) {
-    ctx.emit(headerEvent);
-    ctx.emit(statusLine('error', `Unsupported platform: "${targetPlatform}".`));
-    return;
+    return null;
   }
+  return SIMULATOR_TO_DEVICE_PLATFORM[platformEnum] ?? platformEnum;
+}
 
-  const cleanPlatform = SIMULATOR_TO_DEVICE_PLATFORM[platformEnum] ?? platformEnum;
-  const scheme = params.scheme ?? '';
-  const configuration = params.configuration ?? 'Debug';
+export function createCleanExecutor(
+  executor: CommandExecutor,
+): NonStreamingExecutor<CleanParams, CleanResult> {
+  return async (params) => {
+    if (params.workspacePath && !params.scheme) {
+      const message = 'scheme is required when workspacePath is provided.';
+      return createCleanResult(
+        params,
+        'FAILED',
+        {
+          warnings: [],
+          errors: [{ message }],
+        },
+        message,
+      );
+    }
 
-  const cleanHeaderEvent = header('Clean', [
-    ...(scheme ? [{ label: 'Scheme', value: scheme }] : []),
-    ...(params.workspacePath ? [{ label: 'Workspace', value: params.workspacePath }] : []),
-    ...(params.projectPath ? [{ label: 'Project', value: params.projectPath }] : []),
-    { label: 'Configuration', value: configuration },
-    { label: 'Platform', value: String(cleanPlatform) },
-  ]);
+    const cleanPlatform = resolveCleanPlatform(params);
+    if (!cleanPlatform) {
+      const message = `Unsupported platform: "${params.platform ?? 'iOS'}".`;
+      return createCleanResult(
+        params,
+        'FAILED',
+        {
+          warnings: [],
+          errors: [{ message }],
+        },
+        message,
+      );
+    }
 
-  const command = ['xcodebuild'];
-  let projectDir = '';
+    const configuration = params.configuration ?? 'Debug';
+    const stderrChunks: string[] = [];
 
-  if (params.workspacePath) {
-    const wsPath = path.isAbsolute(params.workspacePath)
-      ? params.workspacePath
-      : path.resolve(process.cwd(), params.workspacePath);
-    projectDir = path.dirname(wsPath);
-    command.push('-workspace', wsPath);
-  } else if (params.projectPath) {
-    const projPath = path.isAbsolute(params.projectPath)
-      ? params.projectPath
-      : path.resolve(process.cwd(), params.projectPath);
-    projectDir = path.dirname(projPath);
-    command.push('-project', projPath);
-  }
+    try {
+      const response = await executeXcodeBuildCommand(
+        {
+          projectPath: params.projectPath,
+          workspacePath: params.workspacePath,
+          scheme: params.scheme ?? '',
+          configuration,
+          derivedDataPath: params.derivedDataPath,
+          extraArgs: params.extraArgs,
+        },
+        {
+          platform: cleanPlatform,
+          logPrefix: 'Clean',
+        },
+        params.preferXcodebuild ?? false,
+        'clean',
+        executor,
+        {
+          onStderr: (chunk) => {
+            stderrChunks.push(chunk);
+          },
+        },
+      );
 
-  command.push('-scheme', scheme);
-  command.push('-configuration', configuration);
-  command.push('-destination', constructDestinationString(cleanPlatform));
+      const didError = response.isError === true;
+      const stderrLines = extractStderrErrorLines(stderrChunks);
 
-  if (params.derivedDataPath) {
-    const ddPath = path.isAbsolute(params.derivedDataPath)
-      ? params.derivedDataPath
-      : path.resolve(process.cwd(), params.derivedDataPath);
-    command.push('-derivedDataPath', ddPath);
-  }
+      const diagnostics = createBasicDiagnostics({
+        errors: didError ? (stderrLines.length > 0 ? stderrLines : ['Unknown error']) : [],
+      });
 
-  if (params.extraArgs && params.extraArgs.length > 0) {
-    command.push(...params.extraArgs);
-  }
+      return createCleanResult(
+        params,
+        didError ? 'FAILED' : 'SUCCEEDED',
+        diagnostics,
+        didError ? 'Clean failed.' : null,
+        {
+          configuration,
+          cleanPlatform,
+        },
+      );
+    } catch (error) {
+      const diagnosticMessage = toErrorMessage(error);
+      return createCleanResult(
+        params,
+        'FAILED',
+        createBasicDiagnostics({ errors: [diagnosticMessage] }),
+        'Clean failed.',
+        {
+          configuration,
+          cleanPlatform,
+        },
+      );
+    }
+  };
+}
 
-  command.push('clean');
+export async function cleanLogic(params: CleanParams, executor: CommandExecutor): Promise<void> {
+  const ctx = getHandlerContext();
+  const executeClean = createCleanExecutor(executor);
+  const result = await executeClean(params);
 
-  return withErrorHandling(
-    ctx,
-    async () => {
-      const result = await executor(command, 'Clean', false, { cwd: projectDir });
-
-      if (!result.success) {
-        const combinedOutput = [result.error, result.output].filter(Boolean).join('\n').trim();
-        const errorLines = combinedOutput
-          .split('\n')
-          .filter((line) => /error:/i.test(line))
-          .map((line) => line.trim());
-        const errorMessage = errorLines.length > 0 ? errorLines.join('; ') : 'Unknown error';
-        ctx.emit(cleanHeaderEvent);
-        ctx.emit(statusLine('error', `Clean failed: ${errorMessage}`));
-        return;
-      }
-
-      ctx.emit(cleanHeaderEvent);
-      ctx.emit(statusLine('success', 'Clean successful'));
-    },
-    {
-      header: cleanHeaderEvent,
-      errorMessage: ({ message }) => `Clean failed: ${message}`,
-      logMessage: ({ message }) => `Clean failed: ${message}`,
-    },
-  );
+  ctx.structuredOutput = { result, schema: STRUCTURED_OUTPUT_SCHEMA, schemaVersion: '1' };
 }
 
 const publicSchemaObject = baseSchemaObject.omit({
@@ -188,7 +265,7 @@ export const schema = getSessionAwareToolSchemaShape({
 });
 
 export const handler = createSessionAwareTool<CleanParams>({
-  internalSchema: cleanSchema as unknown as z.ZodType<CleanParams, unknown>,
+  internalSchema: toInternalSchema<CleanParams>(cleanSchema),
   logicFunction: cleanLogic,
   getExecutor: getDefaultCommandExecutor,
   requirements: [
