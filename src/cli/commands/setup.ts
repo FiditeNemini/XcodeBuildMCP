@@ -6,6 +6,7 @@ import { discoverProjects } from '../../mcp/tools/project-discovery/discover_pro
 import { listSchemes } from '../../mcp/tools/project-discovery/list_schemes.ts';
 import { listSimulators, type ListedSimulator } from '../../mcp/tools/simulator/list_sims.ts';
 import { loadManifest, type WorkflowManifestEntry } from '../../core/manifest/load-manifest.ts';
+import type { WorkflowTargetPlatform } from '../../core/manifest/schema.ts';
 import { isWorkflowEnabledForRuntime } from '../../visibility/exposure.ts';
 import { getConfig } from '../../utils/config-store.ts';
 import {
@@ -23,11 +24,30 @@ import {
 import type { FileSystemExecutor } from '../../utils/FileSystemExecutor.ts';
 import type { CommandExecutor } from '../../utils/CommandExecutor.ts';
 import { createDoctorDependencies } from '../../mcp/tools/doctor/lib/doctor.deps.ts';
+import { XcodePlatform } from '../../types/common.ts';
+
+type SetupPlatform = WorkflowTargetPlatform;
+
+const SETUP_PLATFORM_TO_SESSION_DEFAULT: Record<SetupPlatform, XcodePlatform> = {
+  macOS: XcodePlatform.macOS,
+  iOS: XcodePlatform.iOSSimulator,
+  tvOS: XcodePlatform.tvOSSimulator,
+  watchOS: XcodePlatform.watchOSSimulator,
+  visionOS: XcodePlatform.visionOSSimulator,
+};
+
+const SIMULATOR_RUNTIME_KEYWORDS: Record<Exclude<SetupPlatform, 'macOS'>, string[]> = {
+  iOS: ['iOS'],
+  tvOS: ['tvOS'],
+  watchOS: ['watchOS'],
+  visionOS: ['visionOS', 'xrOS'],
+};
 
 interface SetupSelection {
   debug: boolean;
   sentryDisabled: boolean;
   enabledWorkflows: string[];
+  platforms: SetupPlatform[];
   projectPath?: string;
   workspacePath?: string;
   scheme: string;
@@ -64,6 +84,22 @@ interface SetupDevice {
   udid: string;
   platform: string;
 }
+
+const PLATFORM_OPTIONS: Array<{ value: SetupPlatform; label: string; description: string }> = [
+  { value: 'macOS', label: 'macOS', description: 'Native macOS apps — no simulator needed' },
+  { value: 'iOS', label: 'iOS', description: 'iPhone and iPad apps, runs on iOS Simulator' },
+  { value: 'tvOS', label: 'tvOS', description: 'Apple TV apps, runs on tvOS Simulator' },
+  {
+    value: 'watchOS',
+    label: 'watchOS',
+    description: 'Apple Watch apps, runs on watchOS Simulator',
+  },
+  {
+    value: 'visionOS',
+    label: 'visionOS',
+    description: 'Apple Vision Pro apps, runs on visionOS Simulator',
+  },
+];
 
 function showPromptHelp(helpText: string, quietOutput: boolean): void {
   if (quietOutput) {
@@ -136,6 +172,43 @@ function normalizeExistingDefaults(config?: ProjectConfig): {
   };
 }
 
+function inferPlatformsFromExisting(config?: ProjectConfig): SetupPlatform[] {
+  if (!config) return [];
+
+  const stored = config.setupPreferences?.platforms;
+  if (stored && stored.length > 0) {
+    return [...stored];
+  }
+
+  // No stored preference: only macOS is unambiguously recoverable from enabledWorkflows.
+  // Simulator-platform identity (iOS vs tvOS vs watchOS vs visionOS) cannot be inferred
+  // from workflow ids alone, so leave it blank and let the wizard re-prompt.
+  const workflows = new Set(config.enabledWorkflows ?? []);
+  return workflows.has('macos') ? ['macOS'] : [];
+}
+
+function derivePlatformSessionDefault(platforms: SetupPlatform[]): string | undefined {
+  if (platforms.length !== 1) return undefined;
+  return SETUP_PLATFORM_TO_SESSION_DEFAULT[platforms[0]];
+}
+
+function filterSimulatorsByPlatforms(
+  simulators: ListedSimulator[],
+  platforms: SetupPlatform[],
+): ListedSimulator[] {
+  const nonMacPlatforms = platforms.filter((p) => p !== 'macOS') as Exclude<
+    SetupPlatform,
+    'macOS'
+  >[];
+  if (nonMacPlatforms.length !== 1) return simulators;
+
+  const keywords = SIMULATOR_RUNTIME_KEYWORDS[nonMacPlatforms[0]];
+  const filtered = simulators.filter((sim) =>
+    keywords.some((keyword) => sim.runtime.includes(keyword)),
+  );
+  return filtered.length > 0 ? filtered : simulators;
+}
+
 function getWorkflowOptions(
   debug: boolean,
   existingConfig?: ProjectConfig,
@@ -157,6 +230,54 @@ function getWorkflowOptions(
     .filter((workflow) => !WORKFLOW_EXCLUDES.has(workflow.id))
     .filter((workflow) => isWorkflowEnabledForRuntime(workflow, predicateContext))
     .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function getRecommendedWorkflowIds(
+  workflows: WorkflowManifestEntry[],
+  platforms: SetupPlatform[],
+): string[] {
+  const selectedPlatforms = new Set<SetupPlatform>(platforms);
+  return workflows
+    .filter((workflow) =>
+      workflow.targetPlatforms.some((platform) => selectedPlatforms.has(platform)),
+    )
+    .map((workflow) => workflow.id);
+}
+
+function getDefaultWorkflowIdsForPlatforms(
+  workflows: WorkflowManifestEntry[],
+  platforms: SetupPlatform[],
+): string[] {
+  const availableIds = new Set(workflows.map((workflow) => workflow.id));
+  const defaults: string[] = [];
+
+  if (platforms.includes('macOS') && availableIds.has('macos')) {
+    defaults.push('macos');
+  }
+
+  if (platforms.some((platform) => platform !== 'macOS') && availableIds.has('simulator')) {
+    defaults.push('simulator');
+  }
+
+  return defaults;
+}
+
+function toWorkflowSelectOptions(workflows: WorkflowManifestEntry[]): SelectOption<string>[] {
+  return workflows.map((workflow) => ({
+    value: workflow.id,
+    label: workflow.id,
+    description: workflow.description,
+  }));
+}
+
+function mergeWorkflowSelections(
+  workflowOptions: SelectOption<string>[],
+  selectedIds: Iterable<string>,
+): string[] {
+  const selected = new Set(selectedIds);
+  return workflowOptions
+    .filter((option) => selected.has(option.value))
+    .map((option) => option.value);
 }
 
 function getChangedFields(
@@ -208,6 +329,11 @@ function getChangedFields(
       beforeValue: beforeDefaults.simulatorName,
       afterValue: afterDefaults.simulatorName,
     },
+    {
+      label: 'setupPreferences.platforms',
+      beforeValue: beforeConfig?.setupPreferences?.platforms,
+      afterValue: afterConfig.setupPreferences?.platforms,
+    },
   ];
 
   const changed: string[] = [];
@@ -226,6 +352,7 @@ async function selectWorkflowIds(opts: {
   debug: boolean;
   existingConfig?: ProjectConfig;
   existingEnabledWorkflows: string[];
+  platforms: SetupPlatform[];
   prompter: Prompter;
   quietOutput: boolean;
 }): Promise<string[]> {
@@ -234,28 +361,91 @@ async function selectWorkflowIds(opts: {
     return [];
   }
 
-  const workflowOptions: SelectOption<string>[] = workflows.map((workflow) => ({
-    value: workflow.id,
-    label: workflow.id,
-    description: workflow.description,
-  }));
-
+  const recommendedIds = new Set(getRecommendedWorkflowIds(workflows, opts.platforms));
+  const workflowOptions = toWorkflowSelectOptions(workflows);
   const defaults =
-    opts.existingEnabledWorkflows.length > 0 ? opts.existingEnabledWorkflows : ['simulator'];
+    opts.existingEnabledWorkflows.length > 0
+      ? opts.existingEnabledWorkflows
+      : getDefaultWorkflowIdsForPlatforms(workflows, opts.platforms);
+
+  if (opts.existingEnabledWorkflows.length > 0 || recommendedIds.size === 0) {
+    showPromptHelp(
+      'Select workflows to choose which groups of tools are enabled by default in this project.',
+      opts.quietOutput,
+    );
+    return opts.prompter.selectMany({
+      message: 'Select workflows to enable',
+      options: workflowOptions,
+      initialSelectedKeys: new Set(defaults),
+      getKey: (value) => value,
+      minSelected: 1,
+    });
+  }
+
+  const recommendedOptions = workflowOptions.filter((option) => recommendedIds.has(option.value));
+  const otherOptions = workflowOptions.filter((option) => !recommendedIds.has(option.value));
 
   showPromptHelp(
-    'Select workflows to choose which groups of tools are enabled by default in this project.',
+    'Recommended workflows are based on your selected platform(s).\n' +
+      'Only the core default workflow is selected automatically; you can adjust the recommendation list freely.',
     opts.quietOutput,
   );
-  const selected = await opts.prompter.selectMany({
-    message: 'Select workflows to enable',
-    options: workflowOptions,
+  const selectedRecommended = await opts.prompter.selectMany({
+    message: 'Select recommended workflows to enable',
+    options: recommendedOptions,
+    initialSelectedKeys: new Set(defaults),
+    getKey: (value) => value,
+    minSelected: otherOptions.length > 0 ? 0 : 1,
+  });
+
+  if (otherOptions.length === 0) {
+    return selectedRecommended;
+  }
+
+  showPromptHelp(
+    'Additional workflows are not specifically recommended for your selected platform(s),\n' +
+      'but you can still enable them if they fit your project.',
+    opts.quietOutput,
+  );
+  const showAdditionalWorkflows =
+    selectedRecommended.length === 0 ||
+    (await opts.prompter.confirm({
+      message: 'Show additional workflows?',
+      defaultValue: false,
+    }));
+
+  if (!showAdditionalWorkflows) {
+    return selectedRecommended;
+  }
+
+  const selectedOther = await opts.prompter.selectMany({
+    message: 'Select additional workflows to enable',
+    options: otherOptions,
+    getKey: (value) => value,
+    minSelected: selectedRecommended.length === 0 ? 1 : 0,
+  });
+
+  return mergeWorkflowSelections(workflowOptions, [...selectedRecommended, ...selectedOther]);
+}
+
+async function selectPlatforms(opts: {
+  existingPlatforms: SetupPlatform[];
+  prompter: Prompter;
+  quietOutput: boolean;
+}): Promise<SetupPlatform[]> {
+  const defaults = opts.existingPlatforms.length > 0 ? opts.existingPlatforms : ['iOS'];
+  showPromptHelp(
+    'Select which platforms you are developing for. This determines which workflows are\n' +
+      'recommended and whether a simulator needs to be configured.',
+    opts.quietOutput,
+  );
+  return opts.prompter.selectMany({
+    message: 'Select target platforms',
+    options: PLATFORM_OPTIONS,
     initialSelectedKeys: new Set(defaults),
     getKey: (value) => value,
     minSelected: 1,
   });
-
-  return selected;
 }
 
 type ProjectChoice = { kind: 'workspace' | 'project'; absolutePath: string };
@@ -369,12 +559,13 @@ function getDefaultSimulatorIndex(
 async function selectSimulator(opts: {
   existingSimulatorId?: string;
   existingSimulatorName?: string;
+  platformFilter: SetupPlatform[];
   executor: CommandExecutor;
   prompter: Prompter;
   isTTY: boolean;
   quietOutput: boolean;
 }): Promise<ListedSimulator | null> {
-  const simulators = await withSpinner({
+  const allSimulators = await withSpinner({
     isTTY: opts.isTTY,
     quietOutput: opts.quietOutput,
     startMessage: 'Loading simulators...',
@@ -387,6 +578,7 @@ async function selectSimulator(opts: {
       }
     },
   });
+  const simulators = filterSimulatorsByPlatforms(allSimulators, opts.platformFilter);
 
   const defaultIndex =
     simulators.length > 0
@@ -692,10 +884,17 @@ async function collectSetupSelection(
     defaultValue: existingConfig?.sentryDisabled ?? false,
   });
 
+  const platforms = await selectPlatforms({
+    existingPlatforms: inferPlatformsFromExisting(existingConfig),
+    prompter: deps.prompter,
+    quietOutput: deps.quietOutput,
+  });
+
   const enabledWorkflows = await selectWorkflowIds({
     debug,
     existingConfig,
     existingEnabledWorkflows: existingConfig?.enabledWorkflows ?? [],
+    platforms,
     prompter: deps.prompter,
     quietOutput: deps.quietOutput,
   });
@@ -721,40 +920,47 @@ async function collectSetupSelection(
     quietOutput: deps.quietOutput,
   });
 
-  const simulator = requiresSimulatorDefault(enabledWorkflows)
-    ? await selectSimulator({
-        existingSimulatorId: existing.simulatorId,
-        existingSimulatorName: existing.simulatorName,
-        executor: deps.executor,
-        prompter: deps.prompter,
-        isTTY,
-        quietOutput: deps.quietOutput,
-      })
-    : undefined;
+  const isMacOsOnly = platforms.length > 0 && platforms.every((p) => p === 'macOS');
 
-  const device = requiresDeviceDefault(enabledWorkflows)
-    ? await selectDevice({
-        existingDeviceId: existing.deviceId,
-        fs: deps.fs,
-        executor: deps.executor,
-        prompter: deps.prompter,
-        isTTY,
-        quietOutput: deps.quietOutput,
-      })
-    : undefined;
+  const simulator =
+    !isMacOsOnly && requiresSimulatorDefault(enabledWorkflows)
+      ? await selectSimulator({
+          existingSimulatorId: existing.simulatorId,
+          existingSimulatorName: existing.simulatorName,
+          platformFilter: platforms,
+          executor: deps.executor,
+          prompter: deps.prompter,
+          isTTY,
+          quietOutput: deps.quietOutput,
+        })
+      : undefined;
+
+  const device =
+    !isMacOsOnly && requiresDeviceDefault(enabledWorkflows)
+      ? await selectDevice({
+          existingDeviceId: existing.deviceId,
+          fs: deps.fs,
+          executor: deps.executor,
+          prompter: deps.prompter,
+          isTTY,
+          quietOutput: deps.quietOutput,
+        })
+      : undefined;
 
   return {
     debug,
     sentryDisabled,
     enabledWorkflows,
+    platforms,
     projectPath: projectChoice.kind === 'project' ? projectChoice.absolutePath : undefined,
     workspacePath: projectChoice.kind === 'workspace' ? projectChoice.absolutePath : undefined,
     scheme,
     deviceId: device?.udid,
     simulatorId: simulator?.udid,
     simulatorName: simulator?.name,
-    clearDeviceDefault: requiresDeviceDefault(enabledWorkflows) && device == null,
-    clearSimulatorDefault: requiresSimulatorDefault(enabledWorkflows) && simulator == null,
+    clearDeviceDefault: isMacOsOnly || (requiresDeviceDefault(enabledWorkflows) && device == null),
+    clearSimulatorDefault:
+      isMacOsOnly || (requiresSimulatorDefault(enabledWorkflows) && simulator == null),
   };
 }
 
@@ -783,6 +989,12 @@ function selectionToMcpConfigJson(selection: SetupSelection): string {
   if (selection.deviceId) {
     env.XCODEBUILDMCP_DEVICE_ID = selection.deviceId;
   }
+
+  const derivedPlatform = derivePlatformSessionDefault(selection.platforms);
+  if (derivedPlatform) {
+    env.XCODEBUILDMCP_PLATFORM = derivedPlatform;
+  }
+
   if (selection.simulatorId) {
     env.XCODEBUILDMCP_SIMULATOR_ID = selection.simulatorId;
   }
@@ -825,18 +1037,20 @@ export async function runSetupWizard(deps?: Partial<SetupDependencies>): Promise
     if (isMcpJson) {
       clack.log.info(
         'This wizard will configure your project defaults for XcodeBuildMCP.\n' +
-          'You will select a project or workspace, scheme, and any\n' +
-          'simulator/device defaults required by the workflows you enable.\n' +
-          'A bootstrap MCP config JSON block for\n' +
-          'clients with limited workspace support will be printed at the end.',
+          'You will select target platforms, workflows, a project or workspace,\n' +
+          'scheme, and any simulator/device defaults required by the workflows\n' +
+          'you enable. A ready-to-paste MCP config JSON block will be printed\n' +
+          'at the end. You can rerun this wizard at any time — previous choices\n' +
+          'are pre-loaded automatically.',
       );
     } else {
       clack.log.info(
         'This wizard will configure your project defaults for XcodeBuildMCP.\n' +
-          'You will select a project or workspace, scheme, and any\n' +
-          'simulator/device defaults required by the workflows you enable.\n' +
-          'Settings are saved to\n' +
-          '.xcodebuildmcp/config.yaml in your project directory.',
+          'You will select target platforms, workflows, a project or workspace,\n' +
+          'scheme, and any simulator/device defaults required by the workflows\n' +
+          'you enable. Settings are saved to .xcodebuildmcp/config.yaml in your\n' +
+          'project directory. You can rerun this wizard at any time — previous\n' +
+          'choices are pre-loaded automatically.',
       );
     }
   }
@@ -906,6 +1120,8 @@ export async function runSetupWizard(deps?: Partial<SetupDependencies>): Promise
         simulatorId: selection.simulatorId,
         simulatorName: selection.simulatorName,
       },
+      setupPreferences:
+        selection.platforms.length > 0 ? { platforms: [...selection.platforms] } : null,
     },
     deleteSessionDefaultKeys,
   });
