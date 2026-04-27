@@ -13,19 +13,13 @@ import {
 import path from 'path';
 import os from 'node:os';
 import { resolveEffectiveDerivedDataPath } from './derived-data-path.ts';
+import { resolvePathFromCwd } from './path.ts';
 import type { XcodebuildPipeline } from './xcodebuild-pipeline.ts';
 import { createNoticeFragment } from './xcodebuild-output.ts';
 
 export interface BuildCommandResult {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
-}
-
-function resolvePathFromCwd(pathValue: string): string {
-  if (path.isAbsolute(pathValue)) {
-    return pathValue;
-  }
-  return path.resolve(process.cwd(), pathValue);
 }
 
 function getDefaultSwiftPackageCachePath(): string {

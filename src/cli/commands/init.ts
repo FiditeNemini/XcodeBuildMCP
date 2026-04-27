@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as clack from '@clack/prompts';
 import { getResourceRoot } from '../../core/resource-root.ts';
 import { createPrompter, isInteractiveTTY, type Prompter } from '../interactive/prompts.ts';
+import { resolvePathFromCwd } from '../../utils/path.ts';
 
 type SkillType = 'mcp' | 'cli';
 
@@ -70,22 +71,6 @@ function readSkillContent(skillType: SkillType): string {
     throw new Error(`Skill source not found: ${sourcePath}`);
   }
   return fs.readFileSync(sourcePath, 'utf8');
-}
-
-function expandHomePrefix(inputPath: string): string {
-  if (inputPath === '~') {
-    return os.homedir();
-  }
-
-  if (inputPath.startsWith('~/') || inputPath.startsWith('~\\')) {
-    return path.join(os.homedir(), inputPath.slice(2));
-  }
-
-  return inputPath;
-}
-
-function resolveDestinationPath(inputPath: string): string {
-  return path.resolve(expandHomePrefix(inputPath));
 }
 
 async function promptConfirm(question: string): Promise<boolean> {
@@ -216,7 +201,7 @@ function resolveTargets(
   operation: 'install' | 'uninstall',
 ): ClientInfo[] {
   if (destFlag) {
-    const resolvedDest = resolveDestinationPath(destFlag);
+    const resolvedDest = resolvePathFromCwd(destFlag);
     if (resolvedDest === path.parse(resolvedDest).root) {
       throw new Error(
         'Refusing to use filesystem root as skills destination. Use a dedicated directory.',
@@ -361,7 +346,7 @@ async function collectInitSelection(
   }
 
   if (destProvided) {
-    const resolvedDest = resolveDestinationPath(argv.dest!);
+    const resolvedDest = resolvePathFromCwd(argv.dest!);
     if (resolvedDest === path.parse(resolvedDest).root) {
       throw new Error(
         'Refusing to use filesystem root as skills destination. Use a dedicated directory.',
@@ -443,7 +428,7 @@ async function promptCustomPath(): Promise<string> {
     message: 'Enter the destination directory path:',
     validate: (value: string | undefined) => {
       if (!value?.trim()) return 'Path cannot be empty.';
-      const resolved = resolveDestinationPath(value);
+      const resolved = resolvePathFromCwd(value);
       if (resolved === path.parse(resolved).root) {
         return 'Refusing to use filesystem root. Use a dedicated directory.';
       }
@@ -456,7 +441,7 @@ async function promptCustomPath(): Promise<string> {
     throw new Error('Operation cancelled.');
   }
 
-  return resolveDestinationPath(result as string);
+  return resolvePathFromCwd(result as string);
 }
 
 export function registerInitCommand(app: Argv, ctx?: { workspaceRoot: string }): void {
