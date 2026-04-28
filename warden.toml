@@ -16,8 +16,27 @@ failOn = "high"
 # reportOn: minimum severity that creates PR annotations
 reportOn = "medium"
 
-# warden-sweep is intentionally NOT registered here — it's a full-repo manual
-# sweep. Invoke directly: `warden --skill warden-sweep`
+# warden-sweep is a full-repo sweep. PR-trigger is intentionally omitted so
+# it does not run on every PR. It runs:
+#   - On schedule via .github/workflows/warden-sweep.yml (workflow_dispatch + cron)
+#   - Locally via `warden --skill warden-sweep`
+[[skills]]
+name = "warden-sweep"
+paths = ["src/**/*.ts", "scripts/**/*.{js,mjs,sh,ts}"]
+ignorePaths = [
+  "**/*.test.ts",
+  "**/__tests__/**",
+  "**/__fixtures__/**",
+  "**/__snapshots__/**",
+]
+
+[[skills.triggers]]
+type = "schedule"
+
+[skills.triggers.schedule]
+issueTitle = "Warden weekly sweep"
+createFixPR = true
+fixBranchPrefix = "warden-sweep"
 
 [[skills]]
 name = "xcodebuildmcp-docs-release-review"

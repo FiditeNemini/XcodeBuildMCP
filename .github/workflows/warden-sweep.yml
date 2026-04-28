@@ -1,0 +1,27 @@
+name: Warden Sweep
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:00 UTC every Monday
+    - cron: "0 6 * * 1"
+
+# contents: write required for sweep to open draft fix PRs
+# issues: write required for the sweep tracking issue
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: write
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    env:
+      WARDEN_MODEL: ${{ secrets.WARDEN_MODEL }}
+      WARDEN_SENTRY_DSN: ${{ secrets.WARDEN_SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: getsentry/warden@v0
+        with:
+          anthropic-api-key: ${{ secrets.WARDEN_ANTHROPIC_API_KEY }}
