@@ -1,0 +1,224 @@
+# Warden Configuration
+# https://github.com/getsentry/warden
+#
+# Warden reviews code using AI-powered skills triggered by GitHub events.
+# Skills live in .agents/skills/ or .claude/skills/
+#
+# Add skills with: warden add <skill-name>
+
+version = 1
+
+# Default settings inherited by all skills
+[defaults]
+# Severity levels: critical, high, medium, low, info
+# failOn: minimum severity that fails the check
+failOn = "high"
+# reportOn: minimum severity that creates PR annotations
+reportOn = "medium"
+
+# warden-sweep is intentionally NOT registered here — it's a full-repo manual
+# sweep. Invoke directly: `warden --skill warden-sweep`
+
+[[skills]]
+name = "xcodebuildmcp-docs-release-review"
+paths = [
+  "README.md",
+  "CHANGELOG.md",
+  "package.json",
+  "scripts/check-docs-cli-commands.js",
+  "scripts/build-website-manifest.mjs",
+  "scripts/generate-github-release-notes.mjs",
+  "scripts/release.sh",
+  "xcodebuildmcp.com/app/docs/_content/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-packaging-resource-review"
+paths = [
+  "package.json",
+  "scripts/copy-build-assets.js",
+  "scripts/package-macos-portable.sh",
+  "scripts/build-website-manifest.mjs",
+  "schemas/**",
+  "manifests/**",
+  "skills/**",
+  "bundled/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-rendering-streaming-review"
+paths = [
+  "src/rendering/**",
+  "src/types/domain-fragments.ts",
+  "src/types/runtime-status.ts",
+  "src/runtime/tool-invoker.ts",
+  "src/runtime/__tests__/tool-invoker.test.ts",
+  "xcodebuildmcp.com/app/docs/_content/architecture-rendering-output.mdx",
+  "xcodebuildmcp.com/app/docs/_content/architecture-tool-lifecycle.mdx",
+  "xcodebuildmcp.com/app/docs/_content/output-formats.mdx",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-runtime-boundary-review"
+paths = [
+  "src/runtime/tool-catalog.ts",
+  "src/runtime/tool-invoker.ts",
+  "src/runtime/types.ts",
+  "src/cli/**",
+  "src/daemon/**",
+  "manifests/tools/*.yaml",
+  "manifests/workflows/*.yaml",
+  "xcodebuildmcp.com/app/docs/_content/architecture-runtime-boundaries.mdx",
+  "xcodebuildmcp.com/app/docs/_content/architecture-manifest-visibility.mdx",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-snapshot-fixture-review"
+paths = [
+  "src/snapshot-tests/__fixtures__/**",
+  "src/snapshot-tests/contracts.ts",
+  "src/snapshot-tests/fixture-io.ts",
+  "src/snapshot-tests/__tests__/fixture-io.test.ts",
+  "src/snapshot-tests/__tests__/json-normalize.test.ts",
+  "src/snapshot-tests/__tests__/json-fixture-schema.test.ts",
+  "xcodebuildmcp.com/app/docs/_content/testing.mdx",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-structured-output-review"
+paths = [
+  "schemas/structured-output/**",
+  "src/core/structured-output-schema.ts",
+  "src/core/__tests__/structured-output-schema.test.ts",
+  "src/snapshot-tests/__fixtures__/json/**",
+  "src/snapshot-tests/__tests__/json-fixture-schema.test.ts",
+  "xcodebuildmcp.com/app/docs/_content/schema-versioning.mdx",
+  "xcodebuildmcp.com/app/docs/_content/output-formats.mdx",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-test-boundary-review"
+paths = [
+  "src/**/__tests__/**",
+  "src/test-utils/**",
+  "src/snapshot-tests/**",
+  "package.json",
+  "xcodebuildmcp.com/app/docs/_content/testing.mdx",
+  "xcodebuildmcp.com/app/docs/_content/contributing.mdx",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-tool-contract-review"
+paths = [
+  "src/mcp/tools/**",
+  "src/core/manifest/schema.ts",
+  "src/runtime/tool-catalog.ts",
+  "src/runtime/types.ts",
+  "manifests/tools/*.yaml",
+  "manifests/workflows/*.yaml",
+  "xcodebuildmcp.com/app/docs/_content/tool-authoring.mdx",
+  "xcodebuildmcp.com/app/docs/_content/architecture-manifest-visibility.mdx",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+# Remote skills from getsentry/skills
+
+[[skills]]
+name = "find-bugs"
+remote = "getsentry/skills"
+paths = ["src/**/*.ts", "scripts/**/*.{js,mjs,ts}"]
+ignorePaths = [
+  "**/*.test.ts",
+  "**/__tests__/**",
+  "**/__fixtures__/**",
+  "**/__snapshots__/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "security-review"
+remote = "getsentry/skills"
+paths = ["src/**/*.ts", "scripts/**/*.{js,mjs,sh,ts}"]
+ignorePaths = [
+  "**/*.test.ts",
+  "**/__tests__/**",
+  "**/__fixtures__/**",
+  "**/__snapshots__/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "gha-security-review"
+remote = "getsentry/skills"
+paths = [".github/workflows/**", ".github/actions/**"]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "code-review"
+remote = "getsentry/skills"
+paths = ["src/**/*.ts"]
+ignorePaths = [
+  "**/*.test.ts",
+  "**/__tests__/**",
+  "**/__fixtures__/**",
+  "**/__snapshots__/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "code-simplifier"
+remote = "getsentry/skills"
+paths = ["src/**/*.ts"]
+ignorePaths = [
+  "**/*.test.ts",
+  "**/__tests__/**",
+  "**/__fixtures__/**",
+  "**/__snapshots__/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
