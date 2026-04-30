@@ -164,16 +164,23 @@ function findInvalidCommands(files, validPairs, validWorkflows) {
 }
 
 function main() {
+  const warnOnly = process.argv.includes('--warn-only');
   const catalog = loadToolCatalog();
   const files = getConsumerDocs();
   const { validPairs, validWorkflows } = buildValidationSets(catalog);
   const findings = findInvalidCommands(files, validPairs, validWorkflows);
 
   if (findings.length > 0) {
-    fail(
-      'Found invalid CLI command references in consumer docs.',
-      `${findings.join('\n')}\n\nRun \`node build/cli.js tools\` to inspect valid commands.`,
-    );
+    const detail = `${findings.join('\n')}\n\nRun \`node build/cli.js tools\` to inspect valid commands.`;
+
+    if (warnOnly) {
+      console.warn('\n⚠️ Found invalid CLI command references in consumer docs.');
+      console.warn(detail);
+      console.warn('\nContinuing because --warn-only was supplied.');
+      return;
+    }
+
+    fail('Found invalid CLI command references in consumer docs.', detail);
   }
 
   console.log('✅ Docs CLI command check passed (README.md + CHANGELOG.md).');

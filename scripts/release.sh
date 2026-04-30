@@ -329,7 +329,6 @@ RELEASE_MANAGED_FILES=(
   "CHANGELOG.md"
   "package.json"
   "package-lock.json"
-  "README.md"
   "server.json"
 )
 
@@ -396,6 +395,13 @@ if [[ -n "$CHANGELOG_VALIDATION_TEMP" ]]; then
 fi
 echo "✅ CHANGELOG entry found and release notes generated."
 
+# Release notes can intentionally include historical CLI commands in migration examples.
+# Keep the consumer-docs check visible during release, but treat those findings as warnings here.
+echo ""
+echo "🧾 Checking docs CLI command references (warnings only for release notes)..."
+node scripts/check-docs-cli-commands.js --warn-only
+echo "ℹ️  Docs CLI command warning check completed."
+
 # Check if package.json already has this version (from previous attempt)
 CURRENT_PACKAGE_VERSION=$(node -p "require('./package.json').version")
 if [[ "$CURRENT_PACKAGE_VERSION" == "$VERSION" ]]; then
@@ -422,18 +428,6 @@ if [[ "$SKIP_VERSION_UPDATE" == "false" ]]; then
   echo "🔧 Setting version to $VERSION..."
   run npm version "$VERSION" --no-git-tag-version
 
-  # README update
-  echo ""
-  echo "📝 Updating install tags in README.md..."
-  README_AT_TAG_REGEX='xcodebuildmcp@([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?|latest|beta|alpha)'
-  README_URLENCODED_AT_TAG_REGEX='xcodebuildmcp%40([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?|latest|beta|alpha)'
-  run sed_inplace "s/${README_AT_TAG_REGEX}/xcodebuildmcp@${NPM_TAG}/g" README.md
-  run sed_inplace "s/${README_URLENCODED_AT_TAG_REGEX}/xcodebuildmcp%40${NPM_TAG}/g" README.md
-
-  echo "📝 Updating Cursor install link config in README.md..."
-  CURSOR_INSTALL_CONFIG=$(node -e "const tag='${NPM_TAG}';const config=JSON.stringify({command:\`npx -y xcodebuildmcp@\${tag} mcp\`});console.log(encodeURIComponent(Buffer.from(config).toString('base64')));")
-  run node -e "const fs=require('fs');const path='README.md';const next='config=${CURSOR_INSTALL_CONFIG}';const contents=fs.readFileSync(path,'utf8');const updated=contents.replace(/config=[^)\\s]+/g,next);fs.writeFileSync(path,updated);"
-
   # server.json update
   echo ""
   if [[ -f server.json ]]; then
@@ -447,9 +441,9 @@ if [[ "$SKIP_VERSION_UPDATE" == "false" ]]; then
   echo ""
   echo "📦 Committing version changes..."
   if [[ -f server.json ]]; then
-    run git add package.json package-lock.json README.md CHANGELOG.md server.json
+    run git add package.json package-lock.json CHANGELOG.md server.json
   else
-    run git add package.json package-lock.json README.md CHANGELOG.md
+    run git add package.json package-lock.json CHANGELOG.md
   fi
   run git commit -m "Release v$VERSION"
 else
