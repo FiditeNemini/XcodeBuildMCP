@@ -45,11 +45,20 @@ paths = [
   "README.md",
   "CHANGELOG.md",
   "package.json",
-  "scripts/check-docs-cli-commands.js",
   "scripts/build-website-manifest.mjs",
   "scripts/generate-github-release-notes.mjs",
   "scripts/release.sh",
   "xcodebuildmcp.com/app/docs/_content/**",
+]
+
+[[skills.triggers]]
+type = "pull_request"
+actions = ["opened", "synchronize", "reopened"]
+
+[[skills]]
+name = "xcodebuildmcp-docs-command-review"
+paths = [
+  "CHANGELOG.md",
 ]
 
 [[skills.triggers]]

@@ -399,13 +399,6 @@ if [[ -n "$CHANGELOG_VALIDATION_TEMP" ]]; then
 fi
 echo "✅ CHANGELOG entry found and release notes generated."
 
-# Release notes can intentionally include historical CLI commands in migration examples.
-# Keep the consumer-docs check visible during release, but treat those findings as warnings here.
-echo ""
-echo "🧾 Checking docs CLI command references (warnings only for release notes)..."
-node scripts/check-docs-cli-commands.js --warn-only
-echo "ℹ️  Docs CLI command warning check completed."
-
 # Check if package.json already has this version (from previous attempt)
 CURRENT_PACKAGE_VERSION=$(node -p "require('./package.json').version")
 if [[ "$CURRENT_PACKAGE_VERSION" == "$VERSION" ]]; then
@@ -449,7 +442,7 @@ if [[ "$SKIP_VERSION_UPDATE" == "false" ]]; then
   else
     run git add package.json package-lock.json CHANGELOG.md
   fi
-  run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Release v$VERSION"
+  run git commit -m "Release v$VERSION"
 else
   echo "⏭️  Skipping version update (already done)"
   # Ensure server.json still matches the desired version (in case of a partial previous run)
@@ -464,7 +457,7 @@ else
   if has_release_managed_changes; then
     echo "📦 Committing release-managed changes..."
     run git add "${RELEASE_MANAGED_FILES[@]}"
-    run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Release v$VERSION"
+    run git commit -m "Release v$VERSION"
   fi
 fi
 
