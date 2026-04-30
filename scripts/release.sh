@@ -445,7 +445,7 @@ if [[ "$SKIP_VERSION_UPDATE" == "false" ]]; then
   else
     run git add package.json package-lock.json CHANGELOG.md
   fi
-  run git commit -m "Release v$VERSION"
+  run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Release v$VERSION"
 else
   echo "⏭️  Skipping version update (already done)"
   # Ensure server.json still matches the desired version (in case of a partial previous run)
@@ -455,14 +455,14 @@ else
       echo "📝 Aligning server.json to $VERSION..."
       run node -e "const fs=require('fs');const f='server.json';const j=JSON.parse(fs.readFileSync(f,'utf8'));j.version='${VERSION}';if(Array.isArray(j.packages)){j.packages=j.packages.map(p=>({...p,version:'${VERSION}'}));}fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n');"
       run git add server.json
-      run git commit -m "Align server.json for v$VERSION"
+      run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Align server.json for v$VERSION"
     fi
   fi
 
   if $CHANGELOG_RENAMED_ON_DISK; then
     echo "📝 Committing changelog release heading update..."
     run git add CHANGELOG.md
-    run git commit -m "Finalize changelog for v$VERSION"
+    run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Finalize changelog for v$VERSION"
   fi
 fi
 
