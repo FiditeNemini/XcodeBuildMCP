@@ -21,7 +21,8 @@ function normalizeDevicePlatform(platform?: unknown): unknown {
 }
 
 export const devicePlatformSchema = z
-  .preprocess(normalizeDevicePlatform, z.enum(devicePlatformValues).optional())
+  .preprocess(normalizeDevicePlatform, z.enum(devicePlatformValues))
+  .optional()
   .describe('Device platform: iOS, watchOS, tvOS, or visionOS. Defaults to iOS.');
 
 export function mapDevicePlatform(platform?: DevicePlatform): XcodePlatform {
