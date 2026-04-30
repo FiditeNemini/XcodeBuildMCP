@@ -340,6 +340,10 @@ has_unmanaged_changes() {
   ! git diff-index --quiet HEAD -- . "${exclude_args[@]}"
 }
 
+has_release_managed_changes() {
+  ! git diff --quiet HEAD -- "${RELEASE_MANAGED_FILES[@]}"
+}
+
 # Check if working directory is clean outside release-managed files
 if ! $DRY_RUN; then
   if has_unmanaged_changes; then
@@ -454,15 +458,13 @@ else
     if [[ "$CURRENT_SERVER_VERSION" != "$VERSION" ]]; then
       echo "📝 Aligning server.json to $VERSION..."
       run node -e "const fs=require('fs');const f='server.json';const j=JSON.parse(fs.readFileSync(f,'utf8'));j.version='${VERSION}';if(Array.isArray(j.packages)){j.packages=j.packages.map(p=>({...p,version:'${VERSION}'}));}fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n');"
-      run git add server.json
-      run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Align server.json for v$VERSION"
     fi
   fi
 
-  if $CHANGELOG_RENAMED_ON_DISK; then
-    echo "📝 Committing changelog release heading update..."
-    run git add CHANGELOG.md
-    run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Finalize changelog for v$VERSION"
+  if has_release_managed_changes; then
+    echo "📦 Committing release-managed changes..."
+    run git add "${RELEASE_MANAGED_FILES[@]}"
+    run env XCODEBUILDMCP_DOCS_CHECK_WARN_ONLY=1 git commit -m "Release v$VERSION"
   fi
 fi
 
@@ -473,6 +475,8 @@ run git tag -f "v$VERSION"
 echo ""
 echo "🚀 Pushing to origin..."
 run git push origin "$BRANCH"
+RELEASE_HEAD_SHA=$(git rev-parse HEAD)
+WORKFLOW_SEARCH_STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 run git push origin "v$VERSION"
 
 # In dry-run, stop here (don't monitor workflows, and don't claim a release happened).
@@ -490,8 +494,8 @@ echo "This may take a few minutes..."
 # Poll for the workflow run triggered by this tag (may take a few seconds to appear)
 RUN_ID=""
 for i in $(seq 1 12); do
-  RUN_ID=$(gh run list --workflow=release.yml --branch="v$VERSION" --limit=1 --json databaseId --jq '.[0].databaseId')
-  if [[ -n "$RUN_ID" ]]; then
+  RUN_ID=$(gh run list --workflow=release.yml --branch="v$VERSION" --limit=20 --json databaseId,headSha,createdAt --jq "[.[] | select(.headSha == \"$RELEASE_HEAD_SHA\" and .createdAt >= \"$WORKFLOW_SEARCH_STARTED_AT\")] | .[0].databaseId // \"\"")
+  if [[ -n "$RUN_ID" && "$RUN_ID" != "null" ]]; then
     break
   fi
   echo "  Waiting for workflow to appear... (attempt $i/12)"
@@ -505,7 +509,9 @@ if [[ -n "$RUN_ID" ]]; then
   echo ""
 
   # Watch the workflow with exit status
-  if gh run watch "$RUN_ID" --exit-status; then
+  WATCH_EXIT=0
+  gh run watch "$RUN_ID" --exit-status || WATCH_EXIT=$?
+  if [[ $WATCH_EXIT -eq 0 ]]; then
     echo ""
     echo "✅ Release v$VERSION completed successfully!"
     echo "📦 View on NPM: https://www.npmjs.com/package/xcodebuildmcp/v/$VERSION"
@@ -518,6 +524,13 @@ if [[ -n "$RUN_ID" ]]; then
     echo "ℹ️  This may be a transient API error. The workflow may still be running."
     echo "   Check manually: gh run view $RUN_ID"
     echo ""
+    RUN_STATUS=$(gh run view "$RUN_ID" --json status --jq '.status' || echo "unknown")
+    if [[ "$RUN_STATUS" != "completed" ]]; then
+      echo "⚠️  Workflow is still '$RUN_STATUS'. Keeping tag v$VERSION."
+      echo "   Re-run monitoring manually: gh run watch $RUN_ID --exit-status"
+      exit $WATCH_EXIT
+    fi
+
     # Prefer job state: if the primary 'release' job succeeded, treat as success.
     RELEASE_JOB_CONCLUSION=$(gh run view "$RUN_ID" --json jobs --jq '.jobs[] | select(.name=="release") | .conclusion')
     if [ "$RELEASE_JOB_CONCLUSION" = "success" ]; then
