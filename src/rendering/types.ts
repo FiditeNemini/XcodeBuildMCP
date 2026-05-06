@@ -17,7 +17,6 @@ export interface RenderSession {
   setNextSteps?(steps: NextStep[], runtime: 'cli' | 'daemon' | 'mcp'): void;
   getNextSteps?(): readonly NextStep[];
   getNextStepsRuntime?(): 'cli' | 'daemon' | 'mcp' | undefined;
-  getFragments(): readonly AnyFragment[];
   getAttachments(): readonly ImageAttachment[];
   isError(): boolean;
   finalize(): string;
@@ -37,8 +36,6 @@ export interface StructuredToolOutput {
 export interface ToolHandlerContext {
   emit: (fragment: AnyFragment) => void;
   attach: (image: ImageAttachment) => void;
-  liveProgressEnabled: boolean;
-  streamingFragmentsEnabled: boolean;
   nextStepParams?: NextStepParamsMap;
   nextSteps?: NextStep[];
   structuredOutput?: StructuredToolOutput;

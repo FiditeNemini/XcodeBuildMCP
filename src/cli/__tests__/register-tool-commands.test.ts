@@ -97,8 +97,6 @@ function mockInvokeDirectThroughHandler() {
         attach: (image) => {
           opts.renderSession?.attach(image);
         },
-        liveProgressEnabled: Boolean(opts.onProgress),
-        streamingFragmentsEnabled: Boolean(opts.onProgress),
       };
 
       await tool.handler(args, handlerContext);
@@ -495,20 +493,18 @@ describe('registerToolCommands', () => {
     );
   });
 
-  it('does not duplicate daemon-streamed fragments in the render session for jsonl output', async () => {
+  it('does not duplicate daemon-streamed fragments for jsonl output', async () => {
     const streamedFragment = {
       kind: 'transcript',
       fragment: 'process-line',
       stream: 'stderr',
       line: 'Build Log: /tmp/build.log\n',
     } as const;
-    let observedSessionFragmentCount = 0;
 
     vi.spyOn(DefaultToolInvoker.prototype, 'invokeDirect').mockImplementation(
       async (_tool, _args, opts) => {
         opts.renderSession?.emit(streamedFragment);
         opts.onProgress?.(streamedFragment);
-        observedSessionFragmentCount = opts.renderSession?.getFragments().length ?? 0;
         opts.onStructuredOutput?.({
           schema: 'xcodebuildmcp.output.simulator-list',
           schemaVersion: '1',
@@ -535,7 +531,6 @@ describe('registerToolCommands', () => {
       app.parseAsync(['simulator', 'run-tool', '--output', 'jsonl']),
     ).resolves.toBeDefined();
 
-    expect(observedSessionFragmentCount).toBe(1);
     expect(stdoutChunks.join('')).toBe(
       `${JSON.stringify({
         event: 'transcript.process-line',
@@ -576,7 +571,10 @@ describe('registerToolCommands', () => {
           schemaVersion: '1',
           didError: true,
           error: 'Tool did not produce structured output for --output json',
-          data: null,
+          data: {
+            category: 'runtime',
+            code: 'STRUCTURED_OUTPUT_MISSING',
+          },
         },
         null,
         2,
@@ -585,9 +583,38 @@ describe('registerToolCommands', () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it('rejects json and jsonl output for xcode-ide tools', async () => {
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const tool = createTool({ workflow: 'xcode-ide' });
+  it('supports json and jsonl output for xcode-ide tools through the generic output path', async () => {
+    mockInvokeDirectThroughHandler();
+    const stdoutChunks: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      stdoutChunks.push(String(chunk));
+      return true;
+    });
+
+    const tool = createTool({
+      workflow: 'xcode-ide',
+      cliSchema: {},
+      mcpSchema: {},
+      handler: vi.fn(async (_args, ctx) => {
+        if (ctx) {
+          ctx.structuredOutput = {
+            schema: 'xcodebuildmcp.output.xcode-bridge-call-result',
+            schemaVersion: '2',
+            result: {
+              kind: 'xcode-bridge-call-result',
+              didError: false,
+              error: null,
+              remoteTool: 'DocumentationSearch',
+              succeeded: true,
+              content: [],
+              artifacts: {
+                rawResponseJsonPath: '/tmp/xcode-ide-response.json',
+              },
+            },
+          };
+        }
+      }) as ToolDefinition['handler'],
+    });
     const app = yargs()
       .scriptName('xcodebuildmcp')
       .exitProcess(false)
@@ -605,19 +632,34 @@ describe('registerToolCommands', () => {
     await expect(
       app.parseAsync(['xcode-ide', 'run-tool', '--output', 'json']),
     ).resolves.toBeDefined();
-    expect(consoleError).toHaveBeenLastCalledWith(
-      'Error: --output json is not supported for xcode-ide tools yet',
+    expect(stdoutChunks.join('')).toBe(
+      `${JSON.stringify(
+        {
+          schema: 'xcodebuildmcp.output.xcode-bridge-call-result',
+          schemaVersion: '2',
+          didError: false,
+          error: null,
+          data: {
+            remoteTool: 'DocumentationSearch',
+            succeeded: true,
+            content: [],
+            artifacts: {
+              rawResponseJsonPath: '/tmp/xcode-ide-response.json',
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
     );
-    expect(process.exitCode).toBe(1);
+    expect(process.exitCode).toBeUndefined();
 
-    process.exitCode = undefined;
+    stdoutChunks.length = 0;
 
     await expect(
       app.parseAsync(['xcode-ide', 'run-tool', '--output', 'jsonl']),
     ).resolves.toBeDefined();
-    expect(consoleError).toHaveBeenLastCalledWith(
-      'Error: --output jsonl is not supported for xcode-ide tools yet',
-    );
-    expect(process.exitCode).toBe(1);
+    expect(stdoutChunks.join('')).toBe('');
+    expect(process.exitCode).toBeUndefined();
   });
 });

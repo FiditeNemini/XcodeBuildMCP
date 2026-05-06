@@ -32,13 +32,11 @@ describe('swift package non-streaming tools', () => {
   });
 
   it('carries invocation fragment for swift_package_run', async () => {
-    const { result } = await runToolLogic(
-      () =>
-        swift_package_runLogic(
-          { packagePath: '/test/package' },
-          createMockExecutor({ success: true, output: 'Hello, World!' }),
-        ),
-      { liveProgressEnabled: false },
+    const { result } = await runToolLogic(() =>
+      swift_package_runLogic(
+        { packagePath: '/test/package' },
+        createMockExecutor({ success: true, output: 'Hello, World!' }),
+      ),
     );
 
     expect(result.events).toEqual([
@@ -52,6 +50,13 @@ describe('swift package non-streaming tools', () => {
           target: 'swift-package',
         },
       },
+      expect.objectContaining({
+        kind: 'build-result',
+        fragment: 'build-summary',
+        operation: 'BUILD',
+        status: 'SUCCEEDED',
+        durationMs: expect.any(Number),
+      }),
     ]);
     expect(result.text()).toContain('Swift Package Run');
     expect(result.text()).toContain('Build & Run complete');
