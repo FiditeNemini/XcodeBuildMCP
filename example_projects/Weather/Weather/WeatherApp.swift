@@ -10,7 +10,15 @@ import SwiftUI
 
 @main
 struct WeatherApp: App {
-    private let weatherService: WeatherService = .mock
+    private let weatherService: WeatherService
+
+    init() {
+        if CommandLine.arguments.contains("--mock-weather-api") {
+            weatherService = .mock
+        } else {
+            weatherService = .production
+        }
+    }
 
     var body: some Scene {
         WindowGroup {

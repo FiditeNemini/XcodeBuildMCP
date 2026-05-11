@@ -41,7 +41,7 @@ struct ContentView: View {
     @State private var isLoadingWeather = false
     @State private var weatherErrorMessage: String?
 
-    init(weatherService: WeatherService = .production) {
+    init(weatherService: WeatherService) {
         self.weatherService = weatherService
         _units = State(initialValue: WeatherUnits())
         _savedLocations = State(initialValue: [])
