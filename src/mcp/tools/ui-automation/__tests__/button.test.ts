@@ -1,16 +1,25 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 import * as z from 'zod';
 import {
   createMockExecutor,
   createNoopExecutor,
   createMockCommandResponse,
 } from '../../../../test-utils/mock-executors.ts';
-import { schema, handler, buttonLogic } from '../button.ts';
+import { schema, handler, buttonLogic, createButtonExecutor } from '../button.ts';
 import type { CommandExecutor } from '../../../../utils/execution/index.ts';
 import { AXE_NOT_AVAILABLE_MESSAGE } from '../../../../utils/axe-helpers.ts';
 import { allText, runLogic, callHandler } from '../../../../test-utils/test-helpers.ts';
+import { __resetRuntimeSnapshotStoreForTests } from '../shared/snapshot-ui-state.ts';
+import {
+  createMockAxeHelpers,
+  createTrackingExecutor,
+  simulatorId,
+} from './ui-action-test-helpers.ts';
 
 describe('Button Plugin', () => {
+  beforeEach(() => {
+    __resetRuntimeSnapshotStoreForTests();
+  });
   describe('Export Field Validation (Literal)', () => {
     it('should have handler function', () => {
       expect(typeof handler).toBe('function');
@@ -23,6 +32,9 @@ describe('Button Plugin', () => {
       expect(schemaObj.safeParse({ buttonType: 'home', duration: 2.5 }).success).toBe(true);
       expect(schemaObj.safeParse({ buttonType: 'invalid-button' }).success).toBe(false);
       expect(schemaObj.safeParse({ buttonType: 'home', duration: -1 }).success).toBe(false);
+      expect(schemaObj.safeParse({ buttonType: 'home', duration: 0 }).success).toBe(true);
+      expect(schemaObj.safeParse({ buttonType: 'home', duration: 10 }).success).toBe(true);
+      expect(schemaObj.safeParse({ buttonType: 'home', duration: 10.1 }).success).toBe(false);
 
       const withSimId = schemaObj.safeParse({
         simulatorId: '12345678-1234-4234-8234-123456789012',
@@ -39,7 +51,9 @@ describe('Button Plugin', () => {
     it('should generate correct axe command for basic button press', async () => {
       let capturedCommand: string[] = [];
       const trackingExecutor: CommandExecutor = async (command) => {
-        capturedCommand = command;
+        if (command[1] !== 'describe-ui') {
+          capturedCommand = command;
+        }
         return createMockCommandResponse({
           success: true,
           output: 'button press completed',
@@ -60,6 +74,8 @@ describe('Button Plugin', () => {
           },
           trackingExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -75,7 +91,9 @@ describe('Button Plugin', () => {
     it('should generate correct axe command for button press with duration', async () => {
       let capturedCommand: string[] = [];
       const trackingExecutor: CommandExecutor = async (command) => {
-        capturedCommand = command;
+        if (command[1] !== 'describe-ui') {
+          capturedCommand = command;
+        }
         return createMockCommandResponse({
           success: true,
           output: 'button press completed',
@@ -97,6 +115,8 @@ describe('Button Plugin', () => {
           },
           trackingExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -114,7 +134,9 @@ describe('Button Plugin', () => {
     it('should generate correct axe command for different button types', async () => {
       let capturedCommand: string[] = [];
       const trackingExecutor: CommandExecutor = async (command) => {
-        capturedCommand = command;
+        if (command[1] !== 'describe-ui') {
+          capturedCommand = command;
+        }
         return createMockCommandResponse({
           success: true,
           output: 'button press completed',
@@ -135,6 +157,8 @@ describe('Button Plugin', () => {
           },
           trackingExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -150,7 +174,9 @@ describe('Button Plugin', () => {
     it('should generate correct axe command with bundled axe path', async () => {
       let capturedCommand: string[] = [];
       const trackingExecutor: CommandExecutor = async (command) => {
-        capturedCommand = command;
+        if (command[1] !== 'describe-ui') {
+          capturedCommand = command;
+        }
         return createMockCommandResponse({
           success: true,
           output: 'button press completed',
@@ -171,6 +197,8 @@ describe('Button Plugin', () => {
           },
           trackingExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -181,6 +209,57 @@ describe('Button Plugin', () => {
         '--udid',
         '12345678-1234-4234-8234-123456789012',
       ]);
+    });
+  });
+
+  describe('Executor Behavior', () => {
+    it('captures a fresh runtime snapshot after a successful button press', async () => {
+      const { calls, executor } = createTrackingExecutor();
+      const executeButton = createButtonExecutor(executor, createMockAxeHelpers(), undefined, 0);
+
+      const result = await executeButton({ simulatorId, buttonType: 'home' });
+
+      expect(result.didError).toBe(false);
+      expect(result.capture).toMatchObject({ type: 'runtime-snapshot', simulatorId });
+      expect(calls.map((call) => call.command[1])).toEqual(['button', 'describe-ui']);
+    });
+
+    it('waits briefly after successful button presses so system UI transitions can settle', async () => {
+      vi.useFakeTimers();
+      try {
+        const mockExecutor = createMockExecutor({
+          success: true,
+          output: 'button press completed',
+          error: undefined,
+          process: { pid: 12345 },
+        });
+
+        const mockAxeHelpers = {
+          getAxePath: () => '/usr/local/bin/axe',
+          getBundledAxeEnvironment: () => ({}),
+        };
+
+        const executeButton = createButtonExecutor(mockExecutor, mockAxeHelpers, undefined, 500);
+        let settled = false;
+        const resultPromise = executeButton({
+          simulatorId: '12345678-1234-4234-8234-123456789012',
+          buttonType: 'home',
+        }).then((result) => {
+          settled = true;
+          return result;
+        });
+
+        await vi.advanceTimersByTimeAsync(499);
+        expect(settled).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1);
+        const result = await resultPromise;
+
+        expect(settled).toBe(true);
+        expect(result.didError).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -259,6 +338,8 @@ describe('Button Plugin', () => {
           },
           mockExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -288,6 +369,8 @@ describe('Button Plugin', () => {
           },
           mockExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -309,6 +392,8 @@ describe('Button Plugin', () => {
           },
           createNoopExecutor(),
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -337,6 +422,8 @@ describe('Button Plugin', () => {
           },
           mockExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -364,6 +451,8 @@ describe('Button Plugin', () => {
           },
           mockExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -391,6 +480,8 @@ describe('Button Plugin', () => {
           },
           mockExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 
@@ -418,6 +509,8 @@ describe('Button Plugin', () => {
           },
           mockExecutor,
           mockAxeHelpers,
+          undefined,
+          0,
         ),
       );
 

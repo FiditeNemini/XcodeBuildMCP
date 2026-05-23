@@ -3,7 +3,7 @@ import type { StructuredOutputEnvelope } from '../../types/structured-output.ts'
 import { formatStructuredEnvelopeFixture, normalizeStructuredEnvelope } from '../json-normalize.ts';
 
 describe('normalizeStructuredEnvelope', () => {
-  it('keeps only failing test cases for failed result snapshots', () => {
+  it('keeps suite-less simulator test cases while normalizing volatile durations', () => {
     const envelope: StructuredOutputEnvelope<unknown> = {
       schema: 'xcodebuildmcp.output.test-result',
       schemaVersion: '1',
@@ -69,6 +69,64 @@ describe('normalizeStructuredEnvelope', () => {
       data: {
         summary: { target: 'swift-package' },
         testCases: [{ test: 'Package Swift Testing pass', status: 'passed', durationMs: 0 }],
+      },
+    });
+  });
+
+  it('normalizes volatile runtime snapshot timestamps', () => {
+    const envelope: StructuredOutputEnvelope<unknown> = {
+      schema: 'xcodebuildmcp.output.capture-result',
+      schemaVersion: '2',
+      didError: false,
+      error: null,
+      data: {
+        summary: { status: 'SUCCEEDED' },
+        artifacts: { simulatorId: 'SIMULATOR-1' },
+        capture: {
+          type: 'runtime-snapshot',
+          protocol: 'rs/1',
+          simulatorId: 'SIMULATOR-1',
+          screenHash: 'screen-hash',
+          seq: 9,
+          capturedAtMs: 123,
+          expiresAtMs: 456,
+          elements: [],
+          actions: [],
+        },
+        uiError: {
+          code: 'TARGET_NOT_ACTIONABLE',
+          message: 'Target is not actionable.',
+          recoveryHint: 'Refresh the snapshot and choose another element.',
+          snapshotAgeMs: 42,
+        },
+      },
+    };
+
+    expect(normalizeStructuredEnvelope(envelope)).toEqual({
+      schema: 'xcodebuildmcp.output.capture-result',
+      schemaVersion: '2',
+      didError: false,
+      error: null,
+      data: {
+        summary: { status: 'SUCCEEDED' },
+        artifacts: { simulatorId: 'SIMULATOR-1' },
+        capture: {
+          type: 'runtime-snapshot',
+          protocol: 'rs/1',
+          simulatorId: 'SIMULATOR-1',
+          screenHash: '<SCREEN_HASH>',
+          seq: 1,
+          capturedAtMs: 1_700_000_000_000,
+          expiresAtMs: 1_700_000_060_000,
+          elements: [],
+          actions: [],
+        },
+        uiError: {
+          code: 'TARGET_NOT_ACTIONABLE',
+          message: 'Target is not actionable.',
+          recoveryHint: 'Refresh the snapshot and choose another element.',
+          snapshotAgeMs: 1234,
+        },
       },
     });
   });
