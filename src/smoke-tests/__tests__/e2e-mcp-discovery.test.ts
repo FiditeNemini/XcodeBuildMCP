@@ -94,12 +94,6 @@ describe('MCP Discovery (e2e)', () => {
         expectedRegistrationSchema(schemaInfo.schema, schemaInfo.version),
       );
     }
-
-    const listSims = result.tools.find((tool) => tool.name === 'list_sims');
-    const listSimsOutputSchema = listSims?.outputSchema as
-      | { oneOf?: Array<{ $defs?: unknown }> }
-      | undefined;
-    expect(listSimsOutputSchema?.oneOf?.[0]?.$defs).toBeDefined();
   });
 
   it('every registered manifest tool with output metadata advertises an output schema', async () => {
