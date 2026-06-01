@@ -1,84 +1,38 @@
 # Changelog
 
-## [Unreleased]
+## [2.6.0]
+
+### New! Runtime UI automation
+
+UI automation now hands your agent reusable context instead of just confirming an action ran. After a tap, swipe, type, wait, or batch, the result includes a compact snapshot of the foreground UI with stable element references and a screen hash, so the agent can pick the next control directly rather than taking another screenshot or re-running a full snapshot. Candidate controls are ranked from real accessibility data, and suggested next steps point at concrete element references instead of guessed coordinates.
+
+In a deterministic Weather-app task, this cut wall-clock time by roughly 70%, token usage by roughly 68%, and total tool calls by roughly 76%.
+
+New tools and options:
+
+- `wait_for_ui` polls the UI until a predicate is satisfied — existence, enabled state, focus, visible text, or settled layout.
+- `batch` performs a sequence of element-reference actions in one call, so agents can run several same-screen taps without a snapshot round-trip between each step.
+- `drag` performs element-reference drag gestures for expanding sheets and scrolling real list regions without coordinate guessing.
+- `snapshot_ui` now returns stable element references and a screen hash. Pass `sinceScreenHash` (MCP) / `--since-screen-hash` (CLI) to skip a full snapshot when the screen has not changed.
+- `type_text` accepts `replaceExisting` to replace a field's current value instead of appending to it.
+
+See [Tools Reference](https://xcodebuildmcp.com/docs/tools).
 
 ### Added
 
-- Added `XCODEBUILDMCP_HEADLESS_LAUNCH` opt-in environment variable that suppresses GUI focus-stealing on macOS: `launch_mac_app` and `build_run_macos` use `open -g` (background launch), Simulator.app GUI launches in `open_sim` and `build_run_sim` are skipped (`simctl boot` continues to run the simulator runtime), and `simulator-management keyboard-shortcut` short-circuits with a clear error because System Events keystrokes inherently require foreground focus. Enabled automatically for snapshot test runs so tests no longer steal window focus.
-- Added `--from-result` to the Claude UI benchmark harness so existing `result.json` artifacts can be rendered as text or JSON without rerunning Claude.
-- Added `nextSteps` hint lines to MCP `structuredContent` and CLI `--output json` envelopes so agents can consume follow-up actions without scraping text. CLI JSON renders shell command lines; MCP structured content renders MCP tool-call hints. Structured result schemas that include `nextSteps` now use schema version 2; existing version 1 schema files remain available for current validators.
-- Added `snapshot_ui sinceScreenHash` / CLI `--since-screen-hash` so callers can skip full runtime snapshot output when the screen hash is unchanged.
-- Added `batch` for executing multiple AXe UI automation steps in one simulator session.
-- Added `wait_for_ui` for polling runtime UI snapshots until UI predicates such as existence, enabled state, focus, text, or settled layout are satisfied. `textContains` can also wait on visible text without a selector when the match is unique.
-- Added structured element-ref `batch` tap steps, preserved same-screen refs after successful `tap` and `batch` actions, and improved UI automation guidance and next steps for one-observation interactions.
-- Added a `replaceExisting` option to `type_text` so agents can replace an existing text-field value instead of accidentally appending to it.
-- Added `drag` for element-ref based drag gestures, enabling agents to expand foreground sheets and drag real scroll/list regions without raw coordinate guesses.
-
-### Changed
-
-- Changed Claude UI benchmark suite runs to create a temporary simulator by default and delete only that harness-created simulator after the suite finishes.
-- Changed Claude UI benchmark exact tool sequence drift to warn by default, with `sequence.mode: fail` available for strict suites.
-- Successful mutating UI automation calls now always attempt to refresh the runtime snapshot after the action instead of preserving or patching cached switch state.
-- Runtime snapshot guidance no longer advertises synthetic sheet swipe targets for foreground sheets. Agents should use real sheet grabber expansion and real descendant scroll/list targets with `drag` instead of inferred app/window-root sheet swipes.
+- Added follow-up `nextSteps` to machine-readable results so agents can act on suggested next actions without scraping prose. MCP `structuredContent` carries MCP tool-call hints and CLI `--output json` carries shell command lines. Result schemas that include `nextSteps` move to schema version 2; version 1 schema files remain available for existing validators. See [Output Formats](https://xcodebuildmcp.com/docs/output-formats).
+- Added an opt-in `XCODEBUILDMCP_HEADLESS_LAUNCH` mode for automated runs that should not steal macOS focus: macOS apps launch in the background, the Simulator window is not brought to the foreground (the simulator runtime still boots), and keyboard-shortcut actions fail fast with a clear foreground-focus requirement. See [Environment Variables](https://xcodebuildmcp.com/docs/env-vars).
 
 ### Fixed
 
+- Fixed structured output so MCP clients that validate tool results can load every structured-output tool again. Published schemas are now self-contained, resolving validation failures such as `PointerToNowhere` in JSON Schema 2020-12 validators that do not re-base references across embedded schemas ([#419](https://github.com/getsentry/XcodeBuildMCP/issues/419), [#423](https://github.com/getsentry/XcodeBuildMCP/pull/423) by [@Subharup-31](https://github.com/Subharup-31)).
 - Clarified `debug_attach_sim` PID attach arguments so the schema documents that `pid` must be used without `bundleId` or `waitFor`, and invalid `pid` + `waitFor: true` calls now fail validation before LLDB is invoked ([#417](https://github.com/getsentry/XcodeBuildMCP/issues/417)).
-- Fixed Claude UI benchmark preflight so transient malformed or still-loading UI snapshots no longer crash the harness or finish before app UI is observable.
-- Fixed Claude UI benchmark preflight so configured first-run dismissals require a concrete simulator ID, suite-provided simulator IDs are recorded in command logs, and preflight-launched apps are terminated after post-launch failures.
-- Fixed Claude UI benchmark config handling so invalid `failurePatterns` regexes and runtime-incompatible `sessionDefaults` fail before a suite starts and partial `allowedVariance` overrides preserve defaults for omitted metrics.
-- Fixed Claude UI benchmark temporary simulator cleanup so simulators created by the harness are deleted even when post-creation setup fails.
-- Fixed UI action snapshot refreshes so timeout while waiting for a settled post-action snapshot returns a recoverable warning instead of unstable element refs.
-- Fixed Claude UI benchmark suite runs so temporary simulators are applied through an isolated per-run MCP config instead of being overridden by repo or example-project config defaults.
-- Fixed simulator launch failures before simulator-name resolution so they are not reported as macOS launch failures.
-- Fixed CLI JSON output so simulator-name resolution failures return the structured error envelope instead of plain stderr.
-- Fixed accessibility hierarchy tips so UI automation guidance prefers runtime element refs over raw coordinate guessing.
-- Fixed `swipe` distance handling so distance is a normalized stroke fraction used for endpoint calculation, and improved sheet/list scroll guidance so real descendant scroll containers are preferred over application/window root fallbacks.
-- Fixed compact runtime snapshots so top-level app and window refs are not advertised as swipe targets just because a generic descendant overflows their frame.
-- Fixed `wait_for_ui` focus waits so elements that do not expose focus state return a typed recoverable error instead of timing out.
-- Fixed invalid `touch` calls so structured output no longer reports a fake touch event when neither `down` nor `up` was requested.
-- Fixed compact runtime snapshots so standalone `other` elements, such as keyboard suggestions, are not advertised as swipe targets unless they behave like scrollable containers.
-- Fixed runtime snapshots so off-screen elements, and clipped elements whose activation point is offscreen, are not advertised as actionable targets.
-- Fixed full-screen swipe gestures so app-level scroll refs avoid unsafe screen edges such as the status bar and notch area.
-- Clarified runtime snapshot tips so agents know element refs are snapshot-specific and must come from the latest `snapshot_ui` or `wait_for_ui` output, and only show swipe guidance when the snapshot includes a scroll ref.
-- Made `wait_for_ui` `textContains` matching case-insensitive so assertions survive platform text normalization such as keyboard auto-capitalization, treat duplicate exact text matches as successful presence assertions, narrow broad selectors by text before reporting ambiguity, reject `text` on non-`textContains` predicates instead of silently ignoring it, and keep recoverable-error candidates compact in structured output.
-- Fixed `tap` on SwiftUI switch element refs by using a touch down/up activation instead of AXe's coordinate tap path.
-- Fixed selector fallback for AXe duplicate-match diagnostics that include parenthesized match counts.
-- Fixed semantic taps and text-field focusing so element refs with duplicate AXe selectors use their resolved snapshot coordinates immediately.
-- Fixed bottom-clipped UI automation targets so taps, touches, and long presses use a visible activation point instead of the hidden center of the accessibility frame.
-- Fixed app-level horizontal swipes so full-screen refs use a content-area y-coordinate instead of missing horizontal carousels by swiping near the hero area.
-- Fixed CLI commands with `simulatorId`-only contracts so `simulatorName` session defaults are resolved to a simulator ID without adding conflicting simulator arguments to tools that already accept `simulatorName`, and fixed simulator lifecycle tools so name-only defaults resolve before simctl operations.
-- Fixed `snapshot_ui` and `wait_for_ui` next steps so they use the resolved simulator ID instead of leaking `SIMULATOR_UUID` placeholders.
-- Fixed the Weather example app so saved-location rows are not reused as search-result rows after editing locations.
-- Fixed the Weather example app's current-location button so it selects the current saved location instead of appearing as a no-op UI automation target.
-- Fixed `type_text` so AXe-unsupported international/accented characters fail before focusing the field, with a clear recoverable error instead of a generic typing failure.
-- Fixed `snapshot_ui` next-step guidance so the suggested tap ref prefers useful tappable controls over text fields, sheet grabbers, close buttons, and clear-search buttons.
-- Fixed compact runtime snapshot JSON so target ordering matches compact text output and prioritizes useful content targets before low-value sheet chrome.
-- Fixed `wait_for_ui` success output so compact text and JSON include the matched elements that satisfied the wait predicate.
-- Fixed `wait_for_ui textContains` so duplicate elements with the same matching visible text satisfy presence-style assertions instead of reporting ambiguity.
-- Fixed CLI `--style minimal` so final text output suppresses generated next steps for daemon-routed tools as intended.
-- Fixed `snapshot_ui` next-step guidance so snapshots with no tappable targets no longer suggest tapping the first non-actionable element.
-- Fixed next-step rendering for tools shared across workflows so follow-up commands prefer the workflow that produced the result instead of drifting to another workflow alias.
-- Fixed `snapshot_ui` next-step guidance so calculator-style utility and operator buttons no longer outrank more useful digit/content controls.
-- Fixed `snapshot_ui` compact text, JSON, and next-step guidance so already-selected segmented controls no longer outrank unselected choices.
-- Fixed compact runtime snapshots and next-step guidance so sheet grabbers remain visible as low-priority targets, allowing agents to expand or dismiss sheets without outranking useful content controls.
-- Fixed compact wait-match rows so static assertion matches render with `none` instead of exposing low-level long-press/touch actions as if they were primary agent actions.
-- Fixed compact runtime snapshot ordering and next-step guidance so destructive controls such as Remove/Delete are demoted behind safer content and navigation targets.
-- Clarified simulator keyboard shortcut failures when Simulator.app is running without a visible device window.
-- Fixed hardware button automation so successful button presses wait briefly for system UI transitions before returning, reducing stale immediate follow-up snapshots.
-- Fixed runtime snapshots so modal sheet hosts remain swipeable after the currently visible sheet content fits inside the viewport.
-- Fixed `wait_for_ui` validation so unknown JSON fields are rejected instead of silently broadening waits.
+- Fixed simulator-name session defaults in the CLI so a name-only default resolves to a simulator ID for tools that take an ID, resolves before simulator lifecycle operations, and does not add conflicting simulator arguments to tools that already accept a name.
+- Fixed CLI JSON output so simulator-name resolution failures return the structured error envelope instead of plain stderr, and a launch failure during resolution is no longer reported as a macOS launch failure.
+- Fixed `type_text` so characters AXe cannot type, such as accented or other international characters, fail with a clear recoverable error before the field is focused instead of a generic typing failure.
 - Fixed CLI numeric array flags so comma-separated values such as `--key-codes 23,18,14` are parsed as numbers instead of failing validation.
-- Fixed runtime snapshots so unlabeled internal custom-action nodes, such as SpringBoard icon subviews, are no longer advertised as likely tap targets.
-- Fixed AXe bundling so downloaded artifacts must report the pinned AXe version, and dirty local AXe builds require an explicit opt-in.
-- Fixed runtime snapshot tips so compact output names all target-ref action tools, including `long_press` and `touch`.
-- Clarified key press and key sequence tool descriptions so agents know key codes are AXe/macOS virtual key codes and should prefer `type_text` for text entry.
-- Clarified `wait_for_ui` timeout recovery hints so agents know selector fields match exact values and should use `textContains` for partial visible text.
-- Fixed UI action success next steps so agents are prompted to refresh runtime snapshots before reusing element refs after actions such as swipes.
-- Fixed `snapshot_ui` next-step guidance so state-changing controls such as segmented units and switches remain available in targets without being promoted as generic tap or batch suggestions.
-- Fixed `snapshot_ui` tap next-step priority so content-rich cards are suggested before navigation controls like Settings.
-- Fixed successful UI action results so they include a fresh runtime snapshot and actionable next steps, reducing follow-up refresh calls after taps, typing, swipes, and batches.
-- Fixed same-simulator UI automation transactions so runtime snapshot resolution, actions, invalidation, and refreshes cannot interleave within one MCP or daemon process.
+
+Various other internal improvements to stability, performance, and code quality.
 
 ## [2.5.2]
 
@@ -715,3 +669,4 @@ Please note that the UI automation features are an early preview and currently i
 ## [v1.0.1] - 2025-04-02
 - Initial release of XcodeBuildMCP
 - Basic support for building iOS and macOS applications
+
