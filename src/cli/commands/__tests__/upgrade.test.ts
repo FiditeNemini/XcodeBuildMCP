@@ -28,9 +28,9 @@ import {
   detectInstallMethodFromPaths,
   truncateReleaseNotes,
   type ReleaseNotes,
-  type ChannelLookupResult,
   type UpgradeDependencies,
   type InstallMethod,
+  type LatestRelease,
 } from '../upgrade.ts';
 
 const mockedConfirm = vi.mocked(clack.confirm);
@@ -46,6 +46,25 @@ function createMockReleaseNotes(overrides?: Partial<ReleaseNotes>): ReleaseNotes
     publishedAt: '2025-01-15T12:00:00Z',
     ...overrides,
   };
+}
+
+function createMockLatestRelease(overrides?: Partial<LatestRelease>): LatestRelease {
+  return {
+    tag: 'v3.0.0',
+    version: '3.0.0',
+    ...overrides,
+  };
+}
+
+function mockGitHubLatestRelease(tagName: string): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      Response.json({
+        tag_name: tagName,
+      }),
+    ),
+  );
 }
 
 function homebrewMethod(): InstallMethod {
@@ -94,33 +113,9 @@ function baseDeps(overrides?: Partial<UpgradeDependencies>): Partial<UpgradeDepe
     packageName: 'xcodebuildmcp',
     repositoryOwner: 'getsentry',
     repositoryName: 'XcodeBuildMCP',
-    fetchLatestVersionForChannel: vi.fn(async () => '3.0.0'),
+    fetchLatestRelease: vi.fn(async () => createMockLatestRelease()),
     fetchReleaseNotesForTag: vi.fn(async () => createMockReleaseNotes()),
-    runChannelLookupCommand: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
     detectInstallMethod: vi.fn(() => homebrewMethod()),
-    spawnUpgradeProcess: vi.fn(async () => 0),
-    isInteractive: vi.fn(() => false),
-    ...overrides,
-  };
-}
-
-/**
- * Create deps that do NOT provide fetchLatestVersionForChannel so the default
- * channel fetcher is rebuilt using the mocked runChannelLookupCommand.
- */
-function channelDeps(
-  method: InstallMethod,
-  lookupResult: ChannelLookupResult,
-  overrides?: Partial<UpgradeDependencies>,
-): Partial<UpgradeDependencies> {
-  return {
-    currentVersion: '2.0.0',
-    packageName: 'xcodebuildmcp',
-    repositoryOwner: 'getsentry',
-    repositoryName: 'XcodeBuildMCP',
-    runChannelLookupCommand: vi.fn(async () => lookupResult),
-    fetchReleaseNotesForTag: vi.fn(async () => createMockReleaseNotes()),
-    detectInstallMethod: vi.fn(() => method),
     spawnUpgradeProcess: vi.fn(async () => 0),
     isInteractive: vi.fn(() => false),
     ...overrides,
@@ -151,6 +146,7 @@ describe('upgrade command', () => {
   afterEach(() => {
     stdoutSpy.mockRestore();
     stderrSpy.mockRestore();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -460,7 +456,7 @@ describe('upgrade command', () => {
       it('exits 0 when versions match (non-TTY)', async () => {
         const deps = baseDeps({
           currentVersion: '3.0.0',
-          fetchLatestVersionForChannel: vi.fn(async () => '3.0.0'),
+          fetchLatestRelease: vi.fn(async () => createMockLatestRelease()),
         });
 
         const code = await runUpgradeCommand({ check: false, yes: false }, deps);
@@ -471,7 +467,7 @@ describe('upgrade command', () => {
       it('exits 0 when versions match (TTY)', async () => {
         const deps = baseDeps({
           currentVersion: '3.0.0',
-          fetchLatestVersionForChannel: vi.fn(async () => '3.0.0'),
+          fetchLatestRelease: vi.fn(async () => createMockLatestRelease()),
           isInteractive: vi.fn(() => true),
         });
 
@@ -488,7 +484,7 @@ describe('upgrade command', () => {
         const spawnMock = vi.fn(async () => 0);
         const deps = baseDeps({
           currentVersion: '4.0.0',
-          fetchLatestVersionForChannel: vi.fn(async () => '3.0.0'),
+          fetchLatestRelease: vi.fn(async () => createMockLatestRelease()),
           spawnUpgradeProcess: spawnMock,
         });
 
@@ -720,7 +716,7 @@ describe('upgrade command', () => {
     describe('channel lookup failures', () => {
       it('exits 1 on network error', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from npm: fetch failed");
           }),
         });
@@ -732,7 +728,7 @@ describe('upgrade command', () => {
 
       it('exits 1 on timeout', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from npm: request timed out");
           }),
         });
@@ -744,7 +740,7 @@ describe('upgrade command', () => {
 
       it('exits 1 on rate limit', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from GitHub: rate limit exceeded");
           }),
         });
@@ -756,7 +752,7 @@ describe('upgrade command', () => {
 
       it('exits 1 on HTTP error', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from GitHub: HTTP 500");
           }),
         });
@@ -768,7 +764,7 @@ describe('upgrade command', () => {
 
       it('exits 1 on missing tag_name', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from GitHub: missing tag_name");
           }),
         });
@@ -780,7 +776,7 @@ describe('upgrade command', () => {
 
       it('shows manual upgrade command on failure when install method is known', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from Homebrew: network error");
           }),
           detectInstallMethod: vi.fn(() => homebrewMethod()),
@@ -794,7 +790,7 @@ describe('upgrade command', () => {
       it('shows failure info via clack in TTY mode', async () => {
         const deps = baseDeps({
           isInteractive: vi.fn(() => true),
-          fetchLatestVersionForChannel: vi.fn(async () => {
+          fetchLatestRelease: vi.fn(async () => {
             throw new Error("couldn't determine latest version from GitHub: missing tag_name");
           }),
         });
@@ -818,7 +814,9 @@ describe('upgrade command', () => {
 
       it('exits 1 when latest version is malformed', async () => {
         const deps = baseDeps({
-          fetchLatestVersionForChannel: vi.fn(async () => 'invalid'),
+          fetchLatestRelease: vi.fn(async () =>
+            createMockLatestRelease({ version: 'invalid', tag: 'invalid' }),
+          ),
         });
 
         const code = await runUpgradeCommand({ check: false, yes: false }, deps);
@@ -890,165 +888,96 @@ describe('upgrade command', () => {
       });
     });
 
-    // ── Channel-specific version lookup ───────────────────────────────
+    // ── Canonical latest release lookup ───────────────────────────────
 
-    describe('channel-specific version lookup', () => {
-      it('npm-global: parses version from npm view JSON output', async () => {
-        const deps = channelDeps(npmGlobalMethod(), {
-          stdout: '"3.0.0"\n',
-          stderr: '',
-          exitCode: 0,
-        });
+    describe('canonical latest release lookup', () => {
+      it.each([
+        ['homebrew', homebrewMethod],
+        ['npm-global', npmGlobalMethod],
+        ['npx', npxMethod],
+        ['unknown', unknownMethod],
+      ] as const)('uses GitHub latest release for %s installs', async (_name, methodFactory) => {
+        mockGitHubLatestRelease('v3.0.0');
+        const deps: Partial<UpgradeDependencies> = {
+          currentVersion: '2.0.0',
+          packageName: 'xcodebuildmcp',
+          repositoryOwner: 'getsentry',
+          repositoryName: 'XcodeBuildMCP',
+          fetchReleaseNotesForTag: vi.fn(async (tag) =>
+            createMockReleaseNotes({
+              body: `Notes for ${tag}`,
+              htmlUrl: `https://github.com/getsentry/XcodeBuildMCP/releases/tag/${tag}`,
+              name: `Release ${tag}`,
+            }),
+          ),
+          detectInstallMethod: vi.fn(() => methodFactory()),
+          spawnUpgradeProcess: vi.fn(async () => 0),
+          isInteractive: vi.fn(() => false),
+        };
 
         const code = await runUpgradeCommand({ check: true, yes: false }, deps);
+        const stdout = collectStdout(stdoutSpy);
+
         expect(code).toBe(0);
-        expect(collectStdout(stdoutSpy)).toContain('Update available');
-        expect(collectStdout(stdoutSpy)).toContain('3.0.0');
+        expect(stdout).toContain('Update available: 2.0.0 → 3.0.0');
+        expect(stdout).toContain('Notes for v3.0.0');
+        expect(stdout).not.toContain('1.6.0');
       });
 
-      it('npx: uses npm view for version lookup', async () => {
-        const runner = vi.fn(async () => ({
-          stdout: '"3.0.0"\n',
-          stderr: '',
-          exitCode: 0,
-        }));
-        const deps = channelDeps(
-          npxMethod(),
-          { stdout: '', stderr: '', exitCode: 0 },
-          {
-            runChannelLookupCommand: runner,
-          },
+      it('preserves the exact GitHub tag when fetching release notes', async () => {
+        mockGitHubLatestRelease('3.0.0');
+        const fetchReleaseNotesForTag = vi.fn(async (tag: string) =>
+          createMockReleaseNotes({
+            htmlUrl: `https://github.com/getsentry/XcodeBuildMCP/releases/tag/${tag}`,
+          }),
         );
+        const deps: Partial<UpgradeDependencies> = {
+          currentVersion: '2.0.0',
+          packageName: 'xcodebuildmcp',
+          repositoryOwner: 'getsentry',
+          repositoryName: 'XcodeBuildMCP',
+          fetchReleaseNotesForTag,
+          detectInstallMethod: vi.fn(() => homebrewMethod()),
+          spawnUpgradeProcess: vi.fn(async () => 0),
+          isInteractive: vi.fn(() => false),
+        };
 
         const code = await runUpgradeCommand({ check: true, yes: false }, deps);
+
         expect(code).toBe(0);
-        expect(runner).toHaveBeenCalledWith(expect.arrayContaining(['npm', 'view']));
+        expect(fetchReleaseNotesForTag).toHaveBeenCalledWith('3.0.0');
+        expect(collectStdout(stdoutSpy)).toContain('Update available: 2.0.0 → 3.0.0');
       });
 
-      it('homebrew: parses version from brew info JSON output', async () => {
-        const brewOutput = JSON.stringify({
-          formulae: [{ versions: { stable: '3.0.0' } }],
-        });
-        const deps = channelDeps(homebrewMethod(), {
-          stdout: brewOutput,
-          stderr: '',
-          exitCode: 0,
-        });
+      it.each([
+        ['homebrew', homebrewMethod],
+        ['npm-global', npmGlobalMethod],
+        ['npx', npxMethod],
+        ['unknown', unknownMethod],
+      ] as const)(
+        'reports GitHub latest lookup failures for %s installs',
+        async (_name, methodFactory) => {
+          vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => new Response(null, { status: 500 })),
+          );
+          const deps: Partial<UpgradeDependencies> = {
+            currentVersion: '2.0.0',
+            packageName: 'xcodebuildmcp',
+            repositoryOwner: 'getsentry',
+            repositoryName: 'XcodeBuildMCP',
+            fetchReleaseNotesForTag: vi.fn(async () => createMockReleaseNotes()),
+            detectInstallMethod: vi.fn(() => methodFactory()),
+            spawnUpgradeProcess: vi.fn(async () => 0),
+            isInteractive: vi.fn(() => false),
+          };
 
-        const code = await runUpgradeCommand({ check: true, yes: false }, deps);
-        expect(code).toBe(0);
-        expect(collectStdout(stdoutSpy)).toContain('Update available');
-        expect(collectStdout(stdoutSpy)).toContain('3.0.0');
-      });
+          const code = await runUpgradeCommand({ check: false, yes: false }, deps);
 
-      it('homebrew: exits 1 when formula is not found (empty formulae array)', async () => {
-        const brewOutput = JSON.stringify({ formulae: [] });
-        const deps = channelDeps(homebrewMethod(), {
-          stdout: brewOutput,
-          stderr: 'Error: No available formula with the name "xcodebuildmcp"',
-          exitCode: 0,
-        });
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('Homebrew');
-        expect(collectStderr(stderrSpy)).toContain('tap installed');
-      });
-
-      it('homebrew: exits 1 on invalid JSON output', async () => {
-        const deps = channelDeps(homebrewMethod(), {
-          stdout: 'not valid json at all',
-          stderr: '',
-          exitCode: 0,
-        });
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('Homebrew');
-        expect(collectStderr(stderrSpy)).toContain('invalid JSON');
-      });
-
-      it('homebrew: exits 1 when brew info exits non-zero', async () => {
-        const deps = channelDeps(homebrewMethod(), {
-          stdout: '',
-          stderr: 'Error: Permission denied',
-          exitCode: 1,
-        });
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('Homebrew');
-        expect(collectStderr(stderrSpy)).toContain('exited with code 1');
-      });
-
-      it('npm-global: exits 1 when npm view exits non-zero', async () => {
-        const deps = channelDeps(npmGlobalMethod(), {
-          stdout: '',
-          stderr: 'npm ERR! 404 Not Found',
-          exitCode: 1,
-        });
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('npm');
-        expect(collectStderr(stderrSpy)).toContain('exited with code 1');
-      });
-
-      it('npm-global: exits 1 on invalid JSON output', async () => {
-        const deps = channelDeps(npmGlobalMethod(), {
-          stdout: 'not json',
-          stderr: '',
-          exitCode: 0,
-        });
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('npm');
-        expect(collectStderr(stderrSpy)).toContain('invalid JSON');
-      });
-
-      it('unknown: falls through to GitHub (mocked at fetchLatestVersionForChannel)', async () => {
-        const deps = baseDeps({
-          detectInstallMethod: vi.fn(() => unknownMethod()),
-          fetchLatestVersionForChannel: vi.fn(async () => '3.0.0'),
-        });
-
-        const code = await runUpgradeCommand({ check: true, yes: false }, deps);
-        expect(code).toBe(0);
-        expect(collectStdout(stdoutSpy)).toContain('Update available');
-      });
-
-      it('homebrew: exits 1 on lookup timeout', async () => {
-        const runner = vi
-          .fn()
-          .mockRejectedValue(new Error('Command timed out after 15 seconds: brew'));
-        const deps = channelDeps(
-          homebrewMethod(),
-          { stdout: '', stderr: '', exitCode: 0 },
-          { runChannelLookupCommand: runner },
-        );
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('Homebrew');
-        expect(collectStderr(stderrSpy)).toContain('timed out');
-      });
-
-      it('npm-global: exits 1 on lookup timeout', async () => {
-        const runner = vi
-          .fn()
-          .mockRejectedValue(new Error('Command timed out after 15 seconds: npm'));
-        const deps = channelDeps(
-          npmGlobalMethod(),
-          { stdout: '', stderr: '', exitCode: 0 },
-          { runChannelLookupCommand: runner },
-        );
-
-        const code = await runUpgradeCommand({ check: false, yes: false }, deps);
-        expect(code).toBe(1);
-        expect(collectStderr(stderrSpy)).toContain('npm');
-        expect(collectStderr(stderrSpy)).toContain('timed out');
-      });
+          expect(code).toBe(1);
+          expect(collectStderr(stderrSpy)).toContain('GitHub: HTTP 500');
+        },
+      );
     });
   });
 });

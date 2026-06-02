@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed `xcodebuildmcp upgrade` so update checks use the latest GitHub release as the canonical target instead of stale package-manager metadata, ensuring multi-version upgrades show release notes for the actual target version.
+
 ## [2.6.1]
 
 ### Fixed

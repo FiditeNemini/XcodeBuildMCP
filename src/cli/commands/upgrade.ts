@@ -41,10 +41,9 @@ export interface ReleaseNotes {
   publishedAt: string | undefined;
 }
 
-export interface ChannelLookupResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
+export interface LatestRelease {
+  tag: string;
+  version: string;
 }
 
 export interface UpgradeDependencies {
@@ -52,9 +51,8 @@ export interface UpgradeDependencies {
   packageName: string;
   repositoryOwner: string;
   repositoryName: string;
-  fetchLatestVersionForChannel: (channel: InstallMethod['kind']) => Promise<string>;
+  fetchLatestRelease: () => Promise<LatestRelease>;
   fetchReleaseNotesForTag: (tag: string) => Promise<ReleaseNotes | null>;
-  runChannelLookupCommand: (argv: string[]) => Promise<ChannelLookupResult>;
   detectInstallMethod: () => InstallMethod;
   spawnUpgradeProcess: (commands: string[][]) => Promise<number>;
   isInteractive: () => boolean;
@@ -204,7 +202,7 @@ export function detectInstallMethodFromPaths(
   };
 }
 
-// --- Channel version lookup ---
+// --- Latest version lookup ---
 
 interface GitHubReleaseResponse {
   tag_name?: string;
@@ -214,90 +212,11 @@ interface GitHubReleaseResponse {
   published_at?: string;
 }
 
-async function fetchLatestVersionFromNpm(
-  pkgName: string,
-  run: (argv: string[]) => Promise<ChannelLookupResult>,
-): Promise<string> {
-  let result: ChannelLookupResult;
-  try {
-    result = await run(['npm', 'view', `${pkgName}@latest`, 'version', '--json']);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`couldn't determine latest version from npm: ${reason}`);
-  }
-
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `couldn't determine latest version from npm: command exited with code ${result.exitCode}`,
-    );
-  }
-
-  let version: unknown;
-  try {
-    version = JSON.parse(result.stdout);
-  } catch {
-    throw new Error("couldn't determine latest version from npm: invalid JSON output");
-  }
-
-  if (typeof version !== 'string') {
-    throw new Error("couldn't determine latest version from npm: unexpected output format");
-  }
-
-  return version;
-}
-
-async function fetchLatestVersionFromHomebrew(
-  pkgName: string,
-  run: (argv: string[]) => Promise<ChannelLookupResult>,
-): Promise<string> {
-  let result: ChannelLookupResult;
-  try {
-    result = await run(['brew', 'info', '--json=v2', pkgName]);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`couldn't determine latest version from Homebrew: ${reason}`);
-  }
-
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `couldn't determine latest version from Homebrew: command exited with code ${result.exitCode}`,
-    );
-  }
-
-  let data: unknown;
-  try {
-    data = JSON.parse(result.stdout);
-  } catch {
-    throw new Error("couldn't determine latest version from Homebrew: invalid JSON output");
-  }
-
-  if (!data || typeof data !== 'object') {
-    throw new Error("couldn't determine latest version from Homebrew: unexpected output format");
-  }
-
-  const formulae = (data as Record<string, unknown>).formulae;
-  if (!Array.isArray(formulae) || formulae.length === 0) {
-    throw new Error(`couldn't find ${pkgName} in Homebrew (is the tap installed?)`);
-  }
-
-  const versions = (formulae[0] as Record<string, unknown>)?.versions;
-  if (!versions || typeof versions !== 'object') {
-    throw new Error("couldn't determine latest version from Homebrew: missing versions field");
-  }
-
-  const stable = (versions as Record<string, unknown>).stable;
-  if (typeof stable !== 'string') {
-    throw new Error("couldn't determine latest version from Homebrew: missing versions.stable");
-  }
-
-  return stable;
-}
-
-async function fetchLatestVersionFromGitHub(
+async function fetchLatestReleaseFromGitHub(
   owner: string,
   name: string,
   pkgVersion: string,
-): Promise<string> {
+): Promise<LatestRelease> {
   const url = `https://api.github.com/repos/${owner}/${name}/releases/latest`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
@@ -334,37 +253,27 @@ async function fetchLatestVersionFromGitHub(
       throw new Error("couldn't determine latest version from GitHub: missing tag_name");
     }
 
-    return data.tag_name.startsWith('v') ? data.tag_name.slice(1) : data.tag_name;
+    return {
+      tag: data.tag_name,
+      version: data.tag_name.startsWith('v') ? data.tag_name.slice(1) : data.tag_name,
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-interface ChannelFetcherDeps {
-  runChannelLookupCommand: (argv: string[]) => Promise<ChannelLookupResult>;
-  packageName: string;
+interface LatestReleaseFetcherDeps {
   repositoryOwner: string;
   repositoryName: string;
   currentVersion: string;
 }
 
-function defaultFetchLatestVersionForChannel(
-  channel: InstallMethod['kind'],
-  deps: ChannelFetcherDeps,
-): Promise<string> {
-  switch (channel) {
-    case 'npm-global':
-    case 'npx':
-      return fetchLatestVersionFromNpm(deps.packageName, deps.runChannelLookupCommand);
-    case 'homebrew':
-      return fetchLatestVersionFromHomebrew(deps.packageName, deps.runChannelLookupCommand);
-    case 'unknown':
-      return fetchLatestVersionFromGitHub(
-        deps.repositoryOwner,
-        deps.repositoryName,
-        deps.currentVersion,
-      );
-  }
+function defaultFetchLatestRelease(deps: LatestReleaseFetcherDeps): Promise<LatestRelease> {
+  return fetchLatestReleaseFromGitHub(
+    deps.repositoryOwner,
+    deps.repositoryName,
+    deps.currentVersion,
+  );
 }
 
 // --- Release notes fetch ---
@@ -460,43 +369,6 @@ export function truncateReleaseNotes(body: string, releaseUrl: string): string {
 
 // --- Spawn runners ---
 
-function defaultRunChannelLookupCommand(argv: string[]): Promise<ChannelLookupResult> {
-  return new Promise((resolve, reject) => {
-    const [cmd, ...args] = argv;
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGTERM');
-    }, 15_000);
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(timeout);
-      if (timedOut) {
-        reject(new Error(`Command timed out after 15 seconds: ${cmd}`));
-        return;
-      }
-      resolve({ stdout, stderr, exitCode: code ?? 1 });
-    });
-  });
-}
-
 function defaultSpawnUpgradeProcess(commands: string[][]): Promise<number> {
   return new Promise((resolve, reject) => {
     let currentIndex = 0;
@@ -553,8 +425,7 @@ function resolveDependencies(overrides?: Partial<UpgradeDependencies>): UpgradeD
     packageName,
     repositoryOwner,
     repositoryName,
-    runChannelLookupCommand: defaultRunChannelLookupCommand,
-    fetchLatestVersionForChannel: undefined!,
+    fetchLatestRelease: undefined!,
     fetchReleaseNotesForTag: undefined!,
     detectInstallMethod: () => detectInstallMethodFromPaths(packageName, collectCandidatePaths()),
     spawnUpgradeProcess: defaultSpawnUpgradeProcess,
@@ -565,9 +436,8 @@ function resolveDependencies(overrides?: Partial<UpgradeDependencies>): UpgradeD
     Object.assign(base, overrides);
   }
 
-  if (!overrides?.fetchLatestVersionForChannel) {
-    base.fetchLatestVersionForChannel = (channel) =>
-      defaultFetchLatestVersionForChannel(channel, base);
+  if (!overrides?.fetchLatestRelease) {
+    base.fetchLatestRelease = () => defaultFetchLatestRelease(base);
   }
 
   if (!overrides?.fetchReleaseNotesForTag) {
@@ -606,20 +476,20 @@ export async function runUpgradeCommand(
 
   const installMethod = d.detectInstallMethod();
 
-  let latestVersion: string;
+  let latestRelease: LatestRelease;
   try {
     if (isTTY) {
       const s = clack.spinner();
       s.start('Checking for updates...');
       try {
-        latestVersion = await d.fetchLatestVersionForChannel(installMethod.kind);
+        latestRelease = await d.fetchLatestRelease();
         s.stop('Update check complete.');
       } catch (error) {
         s.stop('Update check failed.');
         throw error;
       }
     } else {
-      latestVersion = await d.fetchLatestVersionForChannel(installMethod.kind);
+      latestRelease = await d.fetchLatestRelease();
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -645,10 +515,10 @@ export async function runUpgradeCommand(
   }
 
   const parsedCurrent = parseVersion(d.currentVersion);
-  const parsedLatest = parseVersion(latestVersion);
+  const parsedLatest = parseVersion(latestRelease.version);
 
   if (!parsedCurrent || !parsedLatest) {
-    const msg = `Cannot compare versions: current=${d.currentVersion}, latest=${latestVersion}`;
+    const msg = `Cannot compare versions: current=${d.currentVersion}, latest=${latestRelease.version}`;
     if (isTTY) {
       clack.log.error(msg);
       clack.outro('');
@@ -672,7 +542,7 @@ export async function runUpgradeCommand(
   }
 
   if (comparison === 'newer') {
-    const msg = `Local version (${d.currentVersion}) is ahead of latest release (${latestVersion}).`;
+    const msg = `Local version (${d.currentVersion}) is ahead of latest release (${latestRelease.version}).`;
     if (isTTY) {
       clack.log.info(msg);
       clack.outro('');
@@ -682,15 +552,15 @@ export async function runUpgradeCommand(
     return 0;
   }
 
-  const releaseUrl = `https://github.com/${d.repositoryOwner}/${d.repositoryName}/releases/tag/v${latestVersion}`;
+  const releaseUrl = `https://github.com/${d.repositoryOwner}/${d.repositoryName}/releases/tag/${latestRelease.tag}`;
   let releaseNotes: ReleaseNotes | null = null;
   try {
-    releaseNotes = await d.fetchReleaseNotesForTag(`v${latestVersion}`);
+    releaseNotes = await d.fetchReleaseNotesForTag(latestRelease.tag);
   } catch {
     // Non-fatal — notes unavailable
   }
 
-  const versionLine = `${d.currentVersion} → ${latestVersion}`;
+  const versionLine = `${d.currentVersion} → ${latestRelease.version}`;
   const releaseName = releaseNotes?.name ? ` — ${releaseNotes.name}` : '';
   const publishedLine = releaseNotes?.publishedAt
     ? `Published: ${releaseNotes.publishedAt.split('T')[0]}`
