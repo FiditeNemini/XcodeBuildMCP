@@ -11,6 +11,7 @@
 
 - Fixed malformed simulator discovery responses, project discovery path-boundary checks, and compiler diagnostic filenames containing glob metacharacters ([#424](https://github.com/getsentry/XcodeBuildMCP/issues/424)).
 - Fixed `suppressWarnings` being ignored in settled build, build-run, and test output. The flag was honored only while streaming, so warnings still reached the final MCP tool response ([#447](https://github.com/getsentry/XcodeBuildMCP/issues/447)).
+- Fixed iOS scaffold orientation and device-family settings, LLDB command isolation and argument escaping, run-destination parsing without an active scheme, concurrent working-directory mutations, blocking physical-device name lookup, and unverified `xcodemake` downloads ([#459](https://github.com/getsentry/XcodeBuildMCP/issues/459)).
 
 ## [2.6.2]
 
@@ -693,5 +694,4 @@ Please note that the UI automation features are an early preview and currently i
 ## [v1.0.1] - 2025-04-02
 - Initial release of XcodeBuildMCP
 - Basic support for building iOS and macOS applications
-
 
