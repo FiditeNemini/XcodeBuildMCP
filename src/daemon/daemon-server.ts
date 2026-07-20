@@ -61,6 +61,7 @@ function bridgeResultToDaemonResult(
     },
     isError: result.didError,
     nextStepParams: bridgeResult.nextStepParams,
+    nextStepConditionKeys: bridgeResult.nextStepConditionKeys,
   };
 }
 
@@ -221,6 +222,7 @@ export function startDaemonServer(ctx: DaemonServerContext): net.Server {
                 result: {
                   structuredOutput: handlerContext.structuredOutput ?? null,
                   nextStepParams: handlerContext.nextStepParams,
+                  nextStepConditionKeys: handlerContext.nextStepConditionKeys,
                   nextSteps: handlerContext.nextSteps,
                 },
               };

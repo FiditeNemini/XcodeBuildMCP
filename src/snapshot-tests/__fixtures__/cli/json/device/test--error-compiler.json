@@ -1,14 +1,13 @@
 {
   "schema": "xcodebuildmcp.output.test-result",
-  "schemaVersion": "2",
+  "schemaVersion": "3",
   "didError": true,
   "error": "Tests failed",
   "data": {
     "request": {
       "scheme": "CalculatorApp",
       "workspacePath": "example_projects/iOS_Calculator/CalculatorApp.xcworkspace",
-      "derivedDataPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/DerivedData/CalculatorApp-<HASH>",
-      "configuration": "Debug",
+      "derivedDataPath": "<TMPDIR>",
       "platform": "iOS",
       "deviceId": "<UUID>",
       "target": "device",
@@ -20,17 +19,11 @@
     "summary": {
       "status": "FAILED",
       "durationMs": 1234,
-      "counts": {
-        "passed": 0,
-        "failed": 0,
-        "skipped": 0
-      },
       "target": "device"
     },
     "artifacts": {
       "deviceId": "<UUID>",
-      "buildLogPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/logs/test_device_<TIMESTAMP>_pid<PID>.log",
-      "xcresultPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/result-bundles/test_device_<TIMESTAMP>_pid<PID>.xcresult"
+      "buildLogPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/logs/test_device_<TIMESTAMP>_pid<PID>.log"
     },
     "tests": {
       "selected": [
@@ -48,7 +41,7 @@
       "errors": [
         {
           "message": "cannot convert value of type 'String' to specified type 'Int'",
-          "location": "<ROOT>/example_projects/iOS_Calculator/CalculatorApp/CalculatorApp.swift:33"
+          "location": "<ROOT>/example_projects/iOS_Calculator/CalculatorApp/CalculatorApp.swift:53"
         }
       ],
       "testFailures": []

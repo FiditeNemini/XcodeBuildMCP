@@ -54,6 +54,12 @@ describe('normalizeSnapshotOutput', () => {
     );
   });
 
+  it('normalizes both cached and uncached device labels', () => {
+    expect(normalizeSnapshotOutput('Device: iPhone 16 (<UUID>)\nDevice: <UUID>\n')).toBe(
+      'Device: <DEVICE> (<UUID>)\nDevice: <DEVICE> (<UUID>)\n',
+    );
+  });
+
   it('normalizes volatile CoreDevice not-found preambles', () => {
     expect(
       normalizeSnapshotOutput(
@@ -167,12 +173,41 @@ describe('normalizeSnapshotOutput', () => {
     );
   });
 
+  it('normalizes both macOS spellings of a temporary directory without leaving a prefix', () => {
+    const tmpDir = '/var/folders/ab/cd/T';
+
+    expect(
+      normalizeSnapshotOutput(
+        [`${tmpDir}/spm-one/Package.swift`, `/private${tmpDir}/spm-two/Package.swift`].join('\n'),
+        { tmpDir },
+      ),
+    ).toBe('<TMPDIR>/Package.swift\n<TMPDIR>/Package.swift\n');
+  });
+
   it('preserves display-formatted home paths while normalizing workspace hashes', () => {
     expect(
       normalizeSnapshotOutput(
         '~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-c5da0cbe19a7/logs/build.log\n',
       ),
     ).toBe('~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/logs/build.log\n');
+  });
+
+  it('normalizes worktree-specific workspace names to the canonical fixture label', () => {
+    expect(
+      normalizeSnapshotOutput(
+        '~/Library/Developer/XcodeBuildMCP/workspaces/issue-450-c5da0cbe19a7/logs/build.log\n',
+      ),
+    ).toBe('~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/logs/build.log\n');
+  });
+
+  it('normalizes generated test products process and random suffixes', () => {
+    expect(
+      normalizeSnapshotOutput(
+        '~/Library/Developer/XcodeBuildMCP/workspaces/issue-450-c5da0cbe19a7/test-products/test_sim_2026-07-16T13-20-13-467Z_pid31212_06abe32f.xctestproducts\n',
+      ),
+    ).toBe(
+      '~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/test-products/test_sim_<TIMESTAMP>_pid<PID>.xctestproducts\n',
+    );
   });
 
   it('normalizes absolute home XcodeBuildMCP paths to ~/', () => {
@@ -239,6 +274,77 @@ describe('normalizeSnapshotOutput', () => {
     );
   });
 
+  it('normalizes UI recovery refs and accessibility summary counts', () => {
+    expect(
+      normalizeSnapshotOutput(
+        [
+          "Message: Element ref 'e7' does not support 'swipeWithin'.",
+          '  Element: e7',
+          "❌ Element ref 'e7' does not support 'swipeWithin'.",
+          '✅ Runtime UI snapshot captured with 21 elements, 19 likely targets, and 0 scroll areas.',
+          '✅ Wait completed; runtime UI snapshot refreshed with 28 elements, 19 likely targets, and 0 scroll areas.',
+        ].join('\n'),
+      ),
+    ).toBe(
+      [
+        "Message: Element ref '<REF>' does not support 'swipeWithin'.",
+        '  Element: <REF>',
+        "❌ Element ref '<REF>' does not support 'swipeWithin'.",
+        '✅ Runtime UI snapshot captured with <ELEMENT_COUNT> elements, <LIKELY_TARGET_COUNT> likely targets, and <SCROLL_AREA_COUNT> scroll areas.',
+        '✅ Wait completed; runtime UI snapshot refreshed with <ELEMENT_COUNT> elements, <LIKELY_TARGET_COUNT> likely targets, and <SCROLL_AREA_COUNT> scroll areas.',
+      ].join('\n') + '\n',
+    );
+  });
+
+  it('normalizes Swift package target triples', () => {
+    expect(
+      normalizeSnapshotOutput('App Path: <TMPDIR>/spm/.build/arm64-apple-macosx/debug/spm\n'),
+    ).toBe('App Path: <TMPDIR>/spm/.build/<TARGET_TRIPLE>/debug/spm\n');
+  });
+
+  it('normalizes state-dependent swipe follow-up advice', () => {
+    expect(
+      normalizeSnapshotOutput(
+        'Next steps:\n1. Take screenshot for verification: screenshot --simulator-id <UUID>\n',
+      ),
+    ).toBe('Next steps:\n1. <POST_SWIPE_NEXT_STEP>\n');
+    expect(
+      normalizeSnapshotOutput(
+        'Next steps:\n1. Scroll visible content: swipe --simulator-id <UUID> --distance 0.5\n',
+      ),
+    ).toBe('Next steps:\n1. <POST_SWIPE_NEXT_STEP>\n');
+  });
+
+  it('sorts MCP test failures deterministically', () => {
+    expect(
+      normalizeSnapshotOutput(
+        [
+          'Test Failures (2):',
+          '',
+          '  ✗ ZebraSuite / testZebra: failed',
+          '    Zebra.swift:2',
+          '',
+          '  ✗ AlphaSuite / testAlpha: failed',
+          '    Alpha.swift:1',
+          '',
+          '❌ 2 tests failed, 1 passed',
+        ].join('\n'),
+      ),
+    ).toBe(
+      [
+        'Test Failures (2):',
+        '',
+        '  ✗ AlphaSuite / testAlpha: failed',
+        '    Alpha.swift:1',
+        '',
+        '  ✗ ZebraSuite / testZebra: failed',
+        '    Zebra.swift:2',
+        '',
+        '❌ <FAIL_COUNT> tests failed, <PASS_COUNT> passed, <SKIP_COUNT> skipped',
+      ].join('\n') + '\n',
+    );
+  });
+
   it('normalizes runtime and compact UI action rows without hiding action content', () => {
     expect(
       normalizeSnapshotOutput(
@@ -247,6 +353,7 @@ describe('normalizeSnapshotOutput', () => {
           '  e48|tap|button|Camera||com.apple.settings.camera',
           '  e1|swipe|application|Settings||',
           '  [5/8] Write swift-version--58304C5D6DBC2206.txt',
+          '  [6/8] Write swift-version-69A768CDF2A0BEE1.txt',
         ].join('\n') + '\n',
       ),
     ).toBe(
@@ -255,6 +362,7 @@ describe('normalizeSnapshotOutput', () => {
         '  <REF>|tap|button|Camera||com.apple.settings.camera',
         '  <REF>|swipe|application|Settings||',
         '  [5/8] Write swift-version--<HASH>.txt',
+        '  [6/8] Write swift-version--<HASH>.txt',
       ].join('\n') + '\n',
     );
   });

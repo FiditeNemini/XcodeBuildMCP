@@ -19,6 +19,10 @@ vi.mock('../../integrations/xcode-tools-bridge/tool-service.ts', () => ({
   },
 }));
 
+vi.mock('../../integrations/xcode-tools-bridge/bridge-response-artifact.ts', () => ({
+  writeBridgeCallResponseArtifact: vi.fn(async () => ({ path: '/tmp/bridge-response.json' })),
+}));
+
 function createCatalog(tools: ToolDefinition[]): ToolCatalog {
   return {
     tools,
@@ -93,6 +97,7 @@ describe('daemon tool.invoke streaming', () => {
           stream: 'stderr',
           line: 'Build Log: /tmp/build.log',
         });
+        ctx.nextStepConditionKeys = ['build_artifact_available'];
         ctx.nextSteps = [{ label: 'Open the build log' }];
         ctx.structuredOutput = {
           schema: 'xcodebuildmcp.output.simulator-list',
@@ -147,6 +152,7 @@ describe('daemon tool.invoke streaming', () => {
           simulators: [],
         },
       },
+      nextStepConditionKeys: ['build_artifact_available'],
       nextSteps: [{ label: 'Open the build log' }],
     });
   });
@@ -256,5 +262,33 @@ describe('daemon tool.invoke streaming', () => {
         content: [{ type: 'text', text: 'bridge unavailable' }],
       },
     });
+  });
+
+  it('forwards Xcode IDE next-step condition keys through the daemon', async () => {
+    xcodeIdeInvokeToolMock.mockResolvedValueOnce({
+      content: [],
+      nextStepConditionKeys: ['build_artifact_available'],
+    });
+
+    const socketPath = await createSocketPath();
+    cleanupPaths.push(socketPath);
+
+    const server = startDaemonServer({
+      socketPath,
+      startedAt: new Date().toISOString(),
+      enabledWorkflows: ['xcode-ide'],
+      catalog: createCatalog([]),
+      workspaceRoot: '/repo',
+      workspaceKey: 'repo-key',
+      xcodeIdeWorkflowEnabled: true,
+      requestShutdown: () => {},
+    });
+    cleanupServers.push(server);
+    await listen(server, socketPath);
+
+    const client = new DaemonClient({ socketPath, timeout: 1000 });
+    const result = await client.invokeXcodeIdeTool('BuildRemote', {});
+
+    expect(result.nextStepConditionKeys).toEqual(['build_artifact_available']);
   });
 });

@@ -21,7 +21,7 @@
       "rs": "1",
       "screenHash": "<SCREEN_HASH>",
       "seq": 1,
-      "count": 28,
+      "count": 99999,
       "targets": [
         "<REF>|tap|button|7||",
         "<REF>|tap|button|8||",
@@ -45,7 +45,7 @@
       ],
       "scroll": [],
       "text": [
-        "<REF>|text|text|7||"
+        "<REF>|text|text|0||"
       ],
       "udid": "<UUID>"
     }

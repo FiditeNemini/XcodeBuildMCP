@@ -6,7 +6,7 @@ names:
 description: Build for iOS sim (compile-only, no launch).
 outputSchema:
   schema: xcodebuildmcp.output.build-result
-  version: "2"
+  version: '3'
 predicates:
   - hideWhenXcodeAgentMode
 annotations:
@@ -19,3 +19,8 @@ nextSteps:
     toolId: get_sim_app_path
     priority: 1
     when: success
+    condition: app_build_succeeded
+  - label: Run prepared tests
+    toolId: test_sim
+    when: success
+    condition: prepared_tests_available

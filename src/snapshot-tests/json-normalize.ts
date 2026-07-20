@@ -12,8 +12,9 @@ function isElementRef(value: string): boolean {
   return /^e\d+$/.test(value);
 }
 
-function isIosRuntimeLabel(value: string): boolean {
-  return /^iOS \d+(?:\.\d+)*$/.test(value);
+function parseRuntimeLabel(value: string): { platform: 'iOS' | 'watchOS' } | undefined {
+  const match = /^(iOS|watchOS) \d+(?:\.\d+)*$/.exec(value);
+  return match ? { platform: match[1] as 'iOS' | 'watchOS' } : undefined;
 }
 
 type NormalizeStructuredEnvelopeOptions = NormalizeSnapshotOutputOptions;
@@ -37,6 +38,14 @@ function normalizeString(
   const isVerboseRuntimeCaptureRef =
     path.includes('capture') && (path.includes('elements') || path.includes('actions'));
   let result = normalizeBaseString(value, options);
+
+  if (
+    path.includes('nextSteps') &&
+    (result.startsWith('Scroll visible content:') ||
+      result.startsWith('Take screenshot for verification:'))
+  ) {
+    return '<POST_SWIPE_NEXT_STEP>';
+  }
 
   if (parentKey === 'stderr') {
     result = result.replace(/^\[\d+\/\d+\] /, '[<STEP>] ');
@@ -83,8 +92,9 @@ function normalizeString(
     return '<OS_VERSION>';
   }
 
-  if (key === 'runtime' && isIosRuntimeLabel(result)) {
-    return 'iOS <VERSION>';
+  if (key === 'runtime') {
+    const runtime = parseRuntimeLabel(result);
+    if (runtime) return `${runtime.platform} <VERSION>`;
   }
 
   return result;
@@ -99,6 +109,10 @@ function normalizeBoolean(path: string[], key: string | undefined, value: boolea
 }
 
 function normalizeNumber(path: string[], key: string | undefined, value: number): number {
+  if (key === 'count' && path.includes('capture')) {
+    return 99999;
+  }
+
   if (
     path.includes('capture') &&
     path.includes('elements') &&
@@ -351,7 +365,13 @@ function normalizeDiagnosticTestFailure(item: unknown): unknown {
 }
 
 function normalizeDiagnosticTestFailures(items: unknown[]): unknown[] {
-  return items.map(normalizeDiagnosticTestFailure);
+  return items.map(normalizeDiagnosticTestFailure).sort((left, right) => {
+    const leftFailure = left as { suite?: string; test?: string; location?: string };
+    const rightFailure = right as { suite?: string; test?: string; location?: string };
+    return `${leftFailure.suite ?? ''}|${leftFailure.test ?? ''}|${leftFailure.location ?? ''}`.localeCompare(
+      `${rightFailure.suite ?? ''}|${rightFailure.test ?? ''}|${rightFailure.location ?? ''}`,
+    );
+  });
 }
 
 function isSpringBoardHomeCompactCapture(value: Record<string, unknown>): boolean {

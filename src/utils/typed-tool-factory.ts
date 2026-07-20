@@ -5,6 +5,7 @@ import type { CommandExecutor } from './execution/index.ts';
 import { setStructuredErrorOutput } from './structured-error.ts';
 
 import { sessionStore, type SessionDefaults } from './session-store.ts';
+import { filterPreparedTestExtraArgs } from './test-source.ts';
 import { isSessionDefaultsOptOutEnabled } from './environment.ts';
 import { mergeSessionDefaultArgs, type ExclusiveParameterGroup } from './session-default-args.ts';
 
@@ -169,6 +170,7 @@ export function createSessionAwareTool<TParams>(opts: {
   getExecutor: () => CommandExecutor;
   requirements?: SessionRequirement[];
   exclusivePairs?: readonly ExclusiveParameterGroup[];
+  clearSessionDeviceIdUnlessPrepared?: boolean;
 }): ToolHandler {
   return createSessionAwareHandler({
     internalSchema: opts.internalSchema,
@@ -176,6 +178,7 @@ export function createSessionAwareTool<TParams>(opts: {
     getContext: opts.getExecutor,
     requirements: opts.requirements,
     exclusivePairs: opts.exclusivePairs,
+    clearSessionDeviceIdUnlessPrepared: opts.clearSessionDeviceIdUnlessPrepared,
   });
 }
 
@@ -185,6 +188,7 @@ export function createSessionAwareToolWithContext<TParams, TContext>(opts: {
   getContext: () => TContext;
   requirements?: SessionRequirement[];
   exclusivePairs?: readonly ExclusiveParameterGroup[];
+  clearSessionDeviceIdUnlessPrepared?: boolean;
 }): ToolHandler {
   return createSessionAwareHandler(opts);
 }
@@ -195,6 +199,7 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
   getContext: () => TContext;
   requirements?: SessionRequirement[];
   exclusivePairs?: readonly ExclusiveParameterGroup[];
+  clearSessionDeviceIdUnlessPrepared?: boolean;
 }): ToolHandler {
   const {
     internalSchema,
@@ -202,6 +207,7 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
     getContext,
     requirements = [],
     exclusivePairs = [],
+    clearSessionDeviceIdUnlessPrepared = false,
   } = opts;
 
   const impl = async (
@@ -235,6 +241,32 @@ function createSessionAwareHandler<TParams, TContext>(opts: {
       }
 
       const sessionDefaults = filterSessionDefaultsForSchema(sessionStore.getAll(), internalSchema);
+      if (
+        sanitizedArgs.deviceId === undefined &&
+        (sanitizedArgs.buildForTesting === true || clearSessionDeviceIdUnlessPrepared)
+      ) {
+        delete sessionDefaults.deviceId;
+      }
+      const hasExplicitPreparedSource =
+        sanitizedArgs.testProductsPath !== undefined || sanitizedArgs.xctestrunPath !== undefined;
+      if (hasExplicitPreparedSource) {
+        for (const key of [
+          'projectPath',
+          'workspacePath',
+          'scheme',
+          'configuration',
+          'derivedDataPath',
+        ]) {
+          delete sessionDefaults[key];
+        }
+        const sessionExtraArgs = sessionDefaults.extraArgs;
+        if (
+          Array.isArray(sessionExtraArgs) &&
+          sessionExtraArgs.every((argument): argument is string => typeof argument === 'string')
+        ) {
+          sessionDefaults.extraArgs = filterPreparedTestExtraArgs(sessionExtraArgs);
+        }
+      }
       const merged = mergeSessionDefaultArgs({
         defaults: sessionDefaults,
         explicitArgs: sanitizedArgs,

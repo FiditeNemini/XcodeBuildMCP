@@ -13,6 +13,7 @@ const PID_NAME_REGEX = /\bPID \d+\b/g;
 const KILL_PID_REGEX = /(\bkill:\s*)\d+(?=:)/g;
 const PID_FILENAME_SUFFIX_REGEX = /_pid\d+(?:_[0-9a-f]{8})?\.log/g;
 const XCRESULT_FILENAME_PID_SUFFIX_REGEX = /_pid\d+_[0-9a-f]{8}\.xcresult/g;
+const XCTESTPRODUCTS_FILENAME_PID_SUFFIX_REGEX = /_pid\d+_[0-9a-f]{8}\.xctestproducts/g;
 const HELPER_PID_FILENAME_SUFFIX_REGEX =
   /_(?:helperpid\d+_ownerpid\d+|ownerpid\d+)_[0-9a-f]{8}\.log/g;
 const PID_JSON_REGEX = /"pid"\s*:\s*\d+/g;
@@ -40,7 +41,7 @@ const SWIFT_TESTING_DURATION_REGEX = /after \d+\.\d+ seconds/g;
 const TEST_SUMMARY_COUNTS_REGEX =
   /\(Total: \d+(?:, Passed: \d+)?(?:, Failed: \d+)?(?:, Skipped: \d+)?, /g;
 const COVERAGE_CALL_COUNT_REGEX = /called \d+x\)/g;
-const DEVICE_LABEL_REGEX = /Device: .+ \(<UUID>\)/g;
+const DEVICE_LABEL_REGEX = /Device: (?:.+ \(<UUID>\)|<UUID>)/g;
 const UPTIME_REGEX = /Uptime: \d+s/g;
 const RESULT_BUNDLE_LINE_REGEX = /\S+\[\d+:\d+\] Writing error result bundle to \S+/g;
 const DEVICE_TRANSPORT_TYPE_REGEX = /\b(wired|localNetwork)\b/g;
@@ -74,7 +75,7 @@ const CODEX_WORKTREE_NODE_MODULES_REGEX =
   /<HOME>\/\.codex\/worktrees\/[^/:]+\/node_modules\/\.bin/g;
 const XCODEBUILDMCP_HOME_PREFIX_REGEX = /<HOME>(?=\/Library\/Developer\/XcodeBuildMCP(?:\/|$))/g;
 const XCODEBUILDMCP_WORKSPACE_KEY_REGEX =
-  /(~\/Library\/Developer\/XcodeBuildMCP\/workspaces\/[^/\n]+)-[0-9a-f]{12}(?=\/|$)/g;
+  /(~\/Library\/Developer\/XcodeBuildMCP\/workspaces\/)[^/\n]+-[0-9a-f]{12}(?=\/|$)/g;
 const XCODE_IDE_ARTIFACT_OWNER_PID_REGEX = /(\/state\/xcode-ide\/call-tool\/ownerpid)\d+_/g;
 const XCODE_IDE_ARTIFACT_HASH_REGEX =
   /(\/state\/xcode-ide\/call-tool\/[^/\n]+\/[^/\n]+-)[0-9a-f]{8}(?=\.json)/g;
@@ -87,11 +88,18 @@ const UI_CLI_ELEMENT_REF_ARG_REGEX = /(--(?:within-)?element-ref\s+)(["']?)e\d+\
 const UI_OBJECT_ELEMENT_REF_REGEX = /((?:elementRef|withinElementRef|ref)\s*:\s*["'])e\d+(["'])/g;
 const UI_JSON_ELEMENT_REF_REGEX = /("(?:elementRef|withinElementRef|ref)"\s*:\s*")e\d+(")/g;
 const UI_PROSE_ELEMENT_REF_REGEX = /(\b(?:within\s+)?elementRef\s+)e\d+\b/g;
+const UI_QUOTED_ELEMENT_REF_REGEX = /(\bElement ref\s+['"])e\d+(['"])/g;
+const UI_ELEMENT_LINE_REF_REGEX = /(^\s*Element:\s*)e\d+\b/gm;
+const UI_SNAPSHOT_SUMMARY_COUNTS_REGEX =
+  /((?:Runtime UI snapshot captured|Wait completed; runtime UI snapshot refreshed) with )\d+( elements, )\d+( likely targets, and )\d+( scroll areas\.)/g;
+const SWIFT_PACKAGE_TARGET_TRIPLE_REGEX = /(\.build\/)[^/\s]+-apple-macosx[^/\s]*(?=\/)/g;
+const UI_SWIPE_NEXT_STEP_REGEX =
+  /Next steps:\n1\. (?:Scroll visible content: [^\n]+|Take screenshot for verification: [^\n]+)/g;
 const DEPLOYMENT_TARGET_SUGGESTED_VALUES_REGEX = /^(\s*DEPLOYMENT_TARGET_SUGGESTED_VALUES = ).+$/gm;
 const PLATFORM_DEPLOYMENT_TARGET_REGEX =
   /^(\s*(?:DRIVERKIT_DEPLOYMENT_TARGET|MACOSX_DEPLOYMENT_TARGET|TVOS_DEPLOYMENT_TARGET|WATCHOS_DEPLOYMENT_TARGET|XROS_DEPLOYMENT_TARGET) = ).+$/gm;
 const IOS_RUNTIME_HEADING_REGEX = /\biOS \d+(?:\.\d+)*(?=:)/g;
-const SWIFT_VERSION_TEMP_FILE_REGEX = /swift-version--[0-9A-Fa-f]+\.txt/g;
+const SWIFT_VERSION_TEMP_FILE_REGEX = /swift-version--?[0-9A-Fa-f]+\.txt/g;
 const BUILD_SETTINGS_PATH_REGEX = /^( {6}PATH = ).+$/gm;
 const TRAILING_WHITESPACE_REGEX = /[ \t]+$/gm;
 const SIMULATOR_FAILURE_TEST_PROGRESS_BLOCK_REGEX =
@@ -192,6 +200,26 @@ function normalizeSimulatorFailureTestProgressBlock(match: string): string {
   return `Running tests (<TEST_PROGRESS>; final: ${final.completed} completed, ${final.failed} failed, ${final.skipped} skipped)\n`;
 }
 
+function normalizeMcpTestFailureOrder(text: string): string {
+  return text.replace(
+    /(Test Failures \(\d+\):\n\n)([\s\S]*?)(?=\n❌)/g,
+    (_match: string, heading: string, body: string) => {
+      const failures = body
+        .split(/\n{2,}/u)
+        .map((failure) => failure.trimEnd())
+        .filter((failure) => failure.length > 0);
+      return `${heading}${failures.sort(compareCodePoints).join('\n\n')}\n`;
+    },
+  );
+}
+
+function compareCodePoints(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
 export type NormalizeSnapshotOutputOptions = {
   tmpDir?: string;
 };
@@ -205,7 +233,15 @@ export function normalizeSnapshotOutput(
   normalized = normalized.replace(ANSI_REGEX, '');
 
   const projectRoot = path.resolve(process.cwd());
-  normalized = normalized.replace(new RegExp(escapeRegex(projectRoot), 'g'), '<ROOT>');
+  const projectRootAliases = new Set([projectRoot]);
+  if (projectRoot.startsWith('/private/tmp/')) {
+    projectRootAliases.add(projectRoot.slice('/private'.length));
+  } else if (projectRoot.startsWith('/tmp/')) {
+    projectRootAliases.add(`/private${projectRoot}`);
+  }
+  for (const projectRootAlias of projectRootAliases) {
+    normalized = normalized.replace(new RegExp(escapeRegex(projectRootAlias), 'g'), '<ROOT>');
+  }
 
   const home = os.homedir();
   normalized = normalized.replace(new RegExp(escapeRegex(home), 'g'), '<HOME>');
@@ -221,12 +257,20 @@ export function normalizeSnapshotOutput(
   normalized = normalized.replace(new RegExp(`(UID\\s*=\\s*)${os.userInfo().uid}`, 'g'), '$1<UID>');
 
   const tmpDir = options.tmpDir ?? os.tmpdir();
-  normalized = normalized.replace(
-    new RegExp(escapeRegex(tmpDir) + '/[A-Za-z0-9._-]+(?=/|[^A-Za-z0-9._/-]|$)', 'g'),
-    '<TMPDIR>',
-  );
+  const tmpDirAliases = new Set([tmpDir]);
+  if (tmpDir.startsWith('/private/')) {
+    tmpDirAliases.add(tmpDir.slice('/private'.length));
+  } else if (tmpDir.startsWith('/tmp/') || tmpDir.startsWith('/var/')) {
+    tmpDirAliases.add(`/private${tmpDir}`);
+  }
+  for (const tmpDirAlias of [...tmpDirAliases].sort((left, right) => right.length - left.length)) {
+    normalized = normalized.replace(
+      new RegExp(escapeRegex(tmpDirAlias) + '/[A-Za-z0-9._-]+(?=/|[^A-Za-z0-9._/-]|$)', 'g'),
+      '<TMPDIR>',
+    );
+  }
   normalized = normalized.replace(XCODEBUILDMCP_HOME_PREFIX_REGEX, '~');
-  normalized = normalized.replace(XCODEBUILDMCP_WORKSPACE_KEY_REGEX, '$1-<HASH>');
+  normalized = normalized.replace(XCODEBUILDMCP_WORKSPACE_KEY_REGEX, '$1XcodeBuildMCP-<HASH>');
   normalized = normalized.replace(XCODE_IDE_ARTIFACT_OWNER_PID_REGEX, '$1<PID>_');
   normalized = normalized.replace(XCODE_IDE_ARTIFACT_HASH_REGEX, '$1<HASH>');
   normalized = normalized.replace(
@@ -258,6 +302,10 @@ export function normalizeSnapshotOutput(
   normalized = normalized.replace(HELPER_PID_FILENAME_SUFFIX_REGEX, '_pid<PID>.log');
   normalized = normalized.replace(PID_FILENAME_SUFFIX_REGEX, '_pid<PID>.log');
   normalized = normalized.replace(XCRESULT_FILENAME_PID_SUFFIX_REGEX, '_pid<PID>.xcresult');
+  normalized = normalized.replace(
+    XCTESTPRODUCTS_FILENAME_PID_SUFFIX_REGEX,
+    '_pid<PID>.xctestproducts',
+  );
   normalized = normalized.replace(PID_JSON_REGEX, '"pid" : <PID>');
   normalized = normalized.replace(PROCESS_ID_REGEX, 'Process ID: <PID>');
   normalized = normalized.replace(PROCESS_INLINE_PID_REGEX, 'process <PID>');
@@ -331,6 +379,17 @@ export function normalizeSnapshotOutput(
   normalized = normalized.replace(UI_JSON_ELEMENT_REF_REGEX, '$1<REF>$2');
   normalized = normalized.replace(UI_OBJECT_ELEMENT_REF_REGEX, '$1<REF>$2');
   normalized = normalized.replace(UI_PROSE_ELEMENT_REF_REGEX, '$1<REF>');
+  normalized = normalized.replace(UI_QUOTED_ELEMENT_REF_REGEX, '$1<REF>$2');
+  normalized = normalized.replace(UI_ELEMENT_LINE_REF_REGEX, '$1<REF>');
+  normalized = normalized.replace(
+    UI_SNAPSHOT_SUMMARY_COUNTS_REGEX,
+    '$1<ELEMENT_COUNT>$2<LIKELY_TARGET_COUNT>$3<SCROLL_AREA_COUNT>$4',
+  );
+  normalized = normalized.replace(SWIFT_PACKAGE_TARGET_TRIPLE_REGEX, '$1<TARGET_TRIPLE>');
+  normalized = normalized.replace(
+    UI_SWIPE_NEXT_STEP_REGEX,
+    'Next steps:\n1. <POST_SWIPE_NEXT_STEP>',
+  );
   normalized = normalized.replace(
     CODEX_WORKTREE_NODE_MODULES_REGEX,
     '<HOME>/.codex/worktrees/<WORKTREE>/node_modules/.bin',
@@ -412,6 +471,7 @@ export function normalizeSnapshotOutput(
   normalized = normalized.replace(/(\nPATH\n)(?:  [^\n]+\n)+/g, '$1  <PATH_ENTRIES>\n');
 
   normalized = normalizeDoctorProcessTree(normalized);
+  normalized = normalizeMcpTestFailureOrder(normalized);
 
   normalized = normalized.replace(TRAILING_WHITESPACE_REGEX, '');
   normalized = normalized.replace(/\n*$/, '\n');

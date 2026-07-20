@@ -104,7 +104,7 @@ describe('normalizeStructuredEnvelope', () => {
     });
   });
 
-  it('preserves simulator diagnostic test failure order while normalizing volatile Swift Testing suite name', () => {
+  it('sorts diagnostic test failures while normalizing volatile Swift Testing suite names', () => {
     const envelope: StructuredOutputEnvelope<unknown> = {
       schema: 'xcodebuildmcp.output.test-result',
       schemaVersion: '2',
@@ -114,16 +114,16 @@ describe('normalizeStructuredEnvelope', () => {
         diagnostics: {
           testFailures: [
             {
-              suite: 'Calculator Basic Functionality',
-              test: 'This test should fail to verify error reporting',
-              message: 'Expectation failed',
-              location: 'CalculatorServiceTests.swift:37',
-            },
-            {
               suite: 'CalculatorAppTests',
               test: 'testCalculatorServiceFailure',
               message: 'XCTAssertEqual failed',
               location: '<ROOT>/example_projects/iOS_Calculator/CalculatorAppTests.swift:52',
+            },
+            {
+              suite: 'Calculator Basic Functionality',
+              test: 'This test should fail to verify error reporting',
+              message: 'Expectation failed',
+              location: 'CalculatorServiceTests.swift:37',
             },
           ],
         },
@@ -156,6 +156,21 @@ describe('normalizeStructuredEnvelope', () => {
     });
   });
 
+  it('normalizes iOS and watchOS simulator runtime versions', () => {
+    const envelope = {
+      schema: 'xcodebuildmcp.output.simulators-result',
+      schemaVersion: '1',
+      didError: false,
+      error: null,
+      data: { simulators: [{ runtime: 'iOS 26.4' }, { runtime: 'watchOS 27.0' }] },
+    } as StructuredOutputEnvelope<unknown>;
+
+    expect(normalizeStructuredEnvelope(envelope)).toEqual({
+      ...envelope,
+      data: { simulators: [{ runtime: 'iOS <VERSION>' }, { runtime: 'watchOS <VERSION>' }] },
+    });
+  });
+
   it('normalizes UI element refs without hiding action content', () => {
     const envelope: StructuredOutputEnvelope<unknown> = {
       schema: 'xcodebuildmcp.output.ui-action-result',
@@ -172,15 +187,15 @@ describe('normalizeStructuredEnvelope', () => {
           rs: '1',
           screenHash: 'screen-hash',
           seq: 7,
-          count: 2,
+          count: 99999,
           targets: ['e48|tap|button|Camera||com.apple.settings.camera'],
           scroll: ['e1|swipe|application|Calculator||Calculator'],
           text: ['e42|text|text|12:34||'],
         },
       },
       nextSteps: [
-        'Tap: xcodebuildmcp ui-automation tap --element-ref e48',
-        'MCP: swipe({ withinElementRef: "e1" })',
+        'Take screenshot for verification: screenshot({ simulatorId: "SIMULATOR-1" })',
+        'Scroll visible content: swipe({ withinElementRef: "e1" })',
       ],
     };
 
@@ -199,16 +214,13 @@ describe('normalizeStructuredEnvelope', () => {
           rs: '1',
           screenHash: '<SCREEN_HASH>',
           seq: 1,
-          count: 2,
+          count: 99999,
           targets: ['<REF>|tap|button|Camera||com.apple.settings.camera'],
           scroll: ['<REF>|swipe|application|Calculator||Calculator'],
           text: ['<REF>|text|text|<TIME>||'],
         },
       },
-      nextSteps: [
-        'Tap: xcodebuildmcp ui-automation tap --element-ref <REF>',
-        'MCP: swipe({ withinElementRef: "<REF>" })',
-      ],
+      nextSteps: ['<POST_SWIPE_NEXT_STEP>', '<POST_SWIPE_NEXT_STEP>'],
     });
   });
 
@@ -266,7 +278,7 @@ describe('normalizeStructuredEnvelope', () => {
           rs: '1',
           screenHash: 'settings-screen-hash',
           seq: 9,
-          count: 144,
+          count: 99999,
           targets: ['e48|tap|button|Camera||com.apple.settings.camera'],
           scroll: ['e1|swipe|application|Settings||'],
           text: ['e42|text|text|Camera||'],
@@ -276,7 +288,7 @@ describe('normalizeStructuredEnvelope', () => {
           rs: '1',
           screenHash: 'app-screen-hash',
           seq: 10,
-          count: 19,
+          count: 99999,
           targets: ['e14|tap|button|7||'],
           scroll: ['e6|swipe|application|Calculator||Calculator'],
           text: ['e31|text|text|Calculator||'],
@@ -295,7 +307,7 @@ describe('normalizeStructuredEnvelope', () => {
           rs: '1',
           screenHash: '<SCREEN_HASH>',
           seq: 9,
-          count: 144,
+          count: 99999,
           targets: ['<REF>|tap|button|Camera||com.apple.settings.camera'],
           scroll: ['<REF>|swipe|application|Settings||'],
           text: ['<REF>|text|text|Camera||'],
@@ -305,7 +317,7 @@ describe('normalizeStructuredEnvelope', () => {
           rs: '1',
           screenHash: '<SCREEN_HASH>',
           seq: 10,
-          count: 19,
+          count: 99999,
           targets: ['<REF>|tap|button|7||'],
           scroll: ['<REF>|swipe|application|Calculator||Calculator'],
           text: ['<REF>|text|text|Calculator||'],

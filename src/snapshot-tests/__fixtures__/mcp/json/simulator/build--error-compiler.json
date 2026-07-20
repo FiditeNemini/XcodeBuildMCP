@@ -1,6 +1,6 @@
 {
   "schema": "xcodebuildmcp.output.build-result",
-  "schemaVersion": "2",
+  "schemaVersion": "3",
   "didError": true,
   "error": "Build failed",
   "data": {
@@ -17,7 +17,7 @@
       "errors": [
         {
           "message": "cannot convert value of type 'String' to specified type 'Int'",
-          "location": "<ROOT>/example_projects/iOS_Calculator/CalculatorApp/CalculatorApp.swift:33"
+          "location": "<ROOT>/example_projects/iOS_Calculator/CalculatorApp/CalculatorApp.swift:53"
         }
       ]
     }

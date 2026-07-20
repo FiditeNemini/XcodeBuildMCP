@@ -1,14 +1,13 @@
 {
   "schema": "xcodebuildmcp.output.test-result",
-  "schemaVersion": "2",
+  "schemaVersion": "3",
   "didError": true,
   "error": "Tests failed",
   "data": {
     "request": {
       "scheme": "CalculatorApp",
       "workspacePath": "example_projects/iOS_Calculator/CalculatorApp.xcworkspace",
-      "derivedDataPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/DerivedData/CalculatorApp-<HASH>",
-      "configuration": "Debug",
+      "derivedDataPath": "<TMPDIR>",
       "platform": "iOS",
       "deviceId": "<UUID>",
       "target": "device",
@@ -28,7 +27,8 @@
     "artifacts": {
       "deviceId": "<UUID>",
       "buildLogPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/logs/test_device_<TIMESTAMP>_pid<PID>.log",
-      "xcresultPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/result-bundles/test_device_<TIMESTAMP>_pid<PID>.xcresult"
+      "xcresultPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/result-bundles/test_device_<TIMESTAMP>_pid<PID>.xcresult",
+      "testProductsPath": "~/Library/Developer/XcodeBuildMCP/workspaces/XcodeBuildMCP-<HASH>/test-products/test_device_<TIMESTAMP>_pid<PID>.xctestproducts"
     },
     "tests": {
       "discovered": {
