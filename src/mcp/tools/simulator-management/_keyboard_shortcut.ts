@@ -1,7 +1,7 @@
 import type { CommandExecutor } from '../../../utils/execution/index.ts';
 import { log } from '../../../utils/logging/index.ts';
 import { toErrorMessage } from '../../../utils/errors.ts';
-import { buildOpenSimulatorAppCommand, isHeadlessLaunchMode } from '../../../utils/focus-policy.ts';
+import { isHeadlessLaunchMode, openSimulatorFrontend } from '../../../utils/focus-policy.ts';
 
 export type KeyboardShortcut = 'software-keyboard' | 'connect-hardware-keyboard';
 
@@ -57,6 +57,21 @@ function buildKeystrokeScript(shortcut: KeyboardShortcut): string {
   ].join('\n');
 }
 
+function buildDeviceHubKeystrokeScript(shortcut: KeyboardShortcut): string {
+  const modifiers =
+    shortcut === 'connect-hardware-keyboard' ? '{command down, shift down}' : '{command down}';
+  return [
+    'tell application "System Events"',
+    '  set deviceHubProcess to first application process whose bundle identifier is "com.apple.dt.Devices"',
+    '  set frontmost of deviceHubProcess to true',
+    '  delay 0.5',
+    '  tell deviceHubProcess',
+    `    keystroke "k" using ${modifiers}`,
+    '  end tell',
+    'end tell',
+  ].join('\n');
+}
+
 export async function sendKeyboardShortcut(
   simulatorId: string,
   shortcut: KeyboardShortcut,
@@ -105,24 +120,38 @@ export async function sendKeyboardShortcut(
     return {
       success: false,
       error:
-        'Keyboard shortcuts require Simulator.app to be in the foreground, which is incompatible with XCODEBUILDMCP_HEADLESS_LAUNCH mode.',
+        'Keyboard controls require a simulator frontend in the foreground, which is incompatible with XCODEBUILDMCP_HEADLESS_LAUNCH mode.',
     };
   }
 
-  const openCommand = buildOpenSimulatorAppCommand();
-  if (openCommand === null) {
-    return {
-      success: false,
-      error:
-        'Keyboard shortcuts require Simulator.app to be in the foreground, which is incompatible with XCODEBUILDMCP_HEADLESS_LAUNCH mode.',
-    };
-  }
-
-  const openResult = await executor(openCommand, 'Open Simulator App', false);
+  const openResult = await openSimulatorFrontend(executor, { simulatorId });
   if (!openResult.success) {
     return {
       success: false,
-      error: `Failed to open Simulator app: ${openResult.error ?? 'unknown error'}`,
+      error: openResult.error,
+    };
+  }
+
+  if (openResult.frontend === 'device-hub') {
+    const keystrokeResult = await executor(
+      ['osascript', '-e', buildDeviceHubKeystrokeScript(shortcut)],
+      'Send Device Hub Keyboard Shortcut',
+      false,
+    );
+    if (!keystrokeResult.success) {
+      return {
+        success: false,
+        error: `Failed to send Device Hub keyboard shortcut: ${keystrokeResult.error ?? 'unknown error'}`,
+      };
+    }
+    return { success: true };
+  }
+
+  if (openResult.frontend === null) {
+    return {
+      success: false,
+      error:
+        'Keyboard controls require a simulator frontend in the foreground, which is incompatible with XCODEBUILDMCP_HEADLESS_LAUNCH mode.',
     };
   }
 
