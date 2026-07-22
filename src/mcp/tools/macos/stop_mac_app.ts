@@ -14,8 +14,13 @@ import {
 } from '../../../utils/app-lifecycle-results.ts';
 
 const stopMacAppSchema = z.object({
-  appName: z.string().optional(),
-  processId: z.number().optional(),
+  appName: z.string().min(1).optional(),
+  processId: z
+    .number()
+    .int()
+    .positive()
+    .refine(Number.isSafeInteger, 'processId must be a positive safe integer.')
+    .optional(),
 });
 
 type StopMacAppParams = z.infer<typeof stopMacAppSchema>;
@@ -54,20 +59,29 @@ export function createStopMacAppExecutor(
   executor: CommandExecutor,
 ): NonStreamingExecutor<StopMacAppParams, StopMacAppResult> {
   return async (params) => {
-    const artifacts = createStopMacAppArtifacts(params);
-
     if (!params.appName && params.processId === undefined) {
-      return buildStopFailure(artifacts, 'Either appName or processId must be provided.');
+      return buildStopFailure({ appName: '' }, 'Either appName or processId must be provided.');
     }
 
-    const target = params.processId ? `PID ${params.processId}` : params.appName!;
+    if (
+      params.processId !== undefined &&
+      (!Number.isSafeInteger(params.processId) || params.processId <= 0)
+    ) {
+      return buildStopFailure(
+        { appName: params.appName ?? '' },
+        'processId must be a positive safe integer.',
+      );
+    }
+
+    const artifacts = createStopMacAppArtifacts(params);
+    const target = params.processId !== undefined ? `PID ${params.processId}` : params.appName!;
     log('info', `Stopping macOS app: ${target}`);
 
     try {
       const command =
         params.processId !== undefined
           ? ['kill', String(params.processId)]
-          : ['pkill', '-f', params.appName!];
+          : ['killall', '--', params.appName!];
       const result = await executor(command, 'Stop macOS App');
 
       if (!result.success) {
