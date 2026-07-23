@@ -1,27 +1,72 @@
 # Changelog
 
-## [Unreleased]
+## [2.7.0]
+
+### New! Xcode 27 Device Hub simulator support
+
+UI automation tools now work fully with Xcode 27 simulators through Device Hub, including simulator window launching and keyboard controls. XcodeBuildMCP targets the selected simulator directly and uses locale-independent menu actions, while maintaining backward compatibility with Simulator.app on earlier Xcode versions.
+
+### Breaking
+
+#### Build and test structured results now use schema version 3
+
+Build and test tools now return `schemaVersion: "3"` so prepared-test paths can be included in structured results. This affects MCP and CLI JSON consumers that validate `xcodebuildmcp.output.build-result` or `xcodebuildmcp.output.test-result` against version 2; consumers that only display or pass through tool results are unaffected.
+
+If no action is taken, validators pinned to version 2 will reject new build and test results. Update them to accept the version 3 schemas, while retaining version 2 support when older XcodeBuildMCP releases remain in use.
+
+Before:
+
+```text
+https://xcodebuildmcp.com/schemas/structured-output/xcodebuildmcp.output.build-result/2.schema.json
+https://xcodebuildmcp.com/schemas/structured-output/xcodebuildmcp.output.test-result/2.schema.json
+```
+
+After:
+
+```text
+https://xcodebuildmcp.com/schemas/structured-output/xcodebuildmcp.output.build-result/3.schema.json
+https://xcodebuildmcp.com/schemas/structured-output/xcodebuildmcp.output.test-result/3.schema.json
+```
+
+#### Unspecified build configurations now follow the scheme
+
+Build, test, clean, and app-path commands now honor the scheme action's configuration when `configuration` is omitted instead of always using Debug. This fixes incorrect build settings for schemes that use another configuration, but scripts or agents that relied on the implicit Debug selection must now request it explicitly.
+
+Before:
+
+```bash
+xcodebuildmcp simulator build --scheme MyApp --project-path ./MyApp.xcodeproj
+```
+
+After:
+
+```bash
+xcodebuildmcp simulator build \
+  --scheme MyApp \
+  --project-path ./MyApp.xcodeproj \
+  --configuration Debug
+```
+
+For MCP calls, set `configuration: "Debug"` ([#443](https://github.com/getsentry/XcodeBuildMCP/issues/443), [#460](https://github.com/getsentry/XcodeBuildMCP/pull/460) by [@hujunfeng](https://github.com/hujunfeng)).
 
 ### Added
 
-- Added `xcodebuildmcp purge` to report and explicitly clean XcodeBuildMCP-managed workspace storage, including opt-in DerivedData cleanup with dry-run and confirmation safeguards.
-- Added `extraArgs` as a first-class session-default value. Repo config or runtime defaults can now carry common `xcodebuild` flags (for example `-skipPackagePluginValidation` or `-disableAutomaticPackageResolution`) so they don't need repeating on every build or test call. Per-call `extraArgs` replace matching configured flags or build settings and append after non-matching defaults, while an explicit empty array (`extraArgs: []`) clears the defaults for a single call. The session management tools show, set, sync, and clear `extraArgs` alongside the other defaults.
-- Added reusable test preparation to the existing simulator, device, and macOS build tools. Builds can now return a portable `.xctestproducts` artifact, and test tools can run that artifact—or an advanced `.xctestrun` input—without rebuilding before producing a new `.xcresult` ([#450](https://github.com/getsentry/XcodeBuildMCP/issues/450)).
-
-### Changed
-
-- Tool manifests can now conditionally expose static next steps using handler-activated condition keys, while runtime-generated parameters continue to flow through the existing next-step parameter contract.
+- Added `xcodebuildmcp purge` to inspect and clean workspace storage managed by XcodeBuildMCP. It defaults to the current workspace, supports reports and dry runs, and requires explicit opt-in before removing DerivedData.
+- Added reusable `extraArgs` session defaults for build and test commands, so common `xcodebuild` flags and build settings can be configured once in project config or the active session. Per-call values override matching defaults, and `extraArgs: []` clears them for one call ([#463](https://github.com/getsentry/XcodeBuildMCP/pull/463) by [@jknlsn](https://github.com/jknlsn)). See [config.example.yaml](config.example.yaml).
+- Added reusable test preparation to simulator, device, and macOS workflows. Build tools can produce a portable `.xctestproducts` package, and test tools can run it—or an advanced `.xctestrun` file—without rebuilding while still producing a fresh `.xcresult` ([#450](https://github.com/getsentry/XcodeBuildMCP/issues/450)). See [CLI examples](README.md#cli).
 
 ### Fixed
 
-- Fixed malformed simulator discovery responses, project discovery path-boundary checks, and compiler diagnostic filenames containing glob metacharacters ([#424](https://github.com/getsentry/XcodeBuildMCP/issues/424)).
-- Fixed `suppressWarnings` being ignored in settled build, build-run, and test output. The flag was honored only while streaming, so warnings still reached the final MCP tool response ([#447](https://github.com/getsentry/XcodeBuildMCP/issues/447)).
-- Fixed iOS scaffold orientation and device-family settings, LLDB command isolation and argument escaping, run-destination parsing without an active scheme, concurrent working-directory mutations, blocking physical-device name lookup, and unverified `xcodemake` downloads ([#459](https://github.com/getsentry/XcodeBuildMCP/issues/459)).
-- Fixed simulator UI launching and keyboard controls to prefer Xcode 27's Device Hub when available, with Simulator.app as the legacy fallback.
-- Fixed `stop_mac_app` app-name targeting so it no longer terminates unrelated processes whose command lines contain the app name, and reject unsafe process IDs before execution ([#306](https://github.com/getsentry/XcodeBuildMCP/issues/306)).
-- Fixed incremental `xcodemake` builds when DerivedData uses an absolute path by updating the pinned wrapper and delegating Makefile reuse to it so its argument and freshness checks are always applied ([#466](https://github.com/getsentry/XcodeBuildMCP/issues/466)).
-- Fixed the scheduled Warden sweep to authenticate through OpenRouter and track the current v0 action release ([#483](https://github.com/getsentry/XcodeBuildMCP/issues/483)).
-- Fixed shell-mode command execution so environment-derived arguments never become shell source, and restricted CI and Sentry release workflows to read-only repository access.
+- Fixed MCP clients waiting 10–17 seconds for tools to become available, which could make short health checks report a failed connection ([#461](https://github.com/getsentry/XcodeBuildMCP/issues/461), [#468](https://github.com/getsentry/XcodeBuildMCP/pull/468) by [@Pitchfork-and-Torch](https://github.com/Pitchfork-and-Torch)).
+- Fixed simulator commands selecting the wrong platform when a configured simulator is unavailable, especially for projects that support both iOS and visionOS. Setup now ignores unavailable simulators and records the selected platform.
+- Fixed simulator and project discovery failures caused by malformed simulator data, projects with shared path prefixes, and compiler diagnostic filenames containing glob characters ([#424](https://github.com/getsentry/XcodeBuildMCP/issues/424)).
+- Fixed `suppressWarnings` so warnings are omitted from final build, build-and-run, and test responses as well as live progress ([#447](https://github.com/getsentry/XcodeBuildMCP/issues/447), [#470](https://github.com/getsentry/XcodeBuildMCP/pull/470) by [@JoshKappler](https://github.com/JoshKappler)).
+- Fixed multiple edge cases in iOS scaffolding, LLDB sessions, run-destination detection, concurrent operations, and physical-device name lookup that could produce incorrect project settings, mixed debugger output, missing destinations, or blocked responses ([#459](https://github.com/getsentry/XcodeBuildMCP/issues/459)).
+- Fixed `stop_mac_app` app-name targeting so it no longer terminates unrelated processes whose later command-line arguments contain the app name, and rejects unsafe process IDs before execution ([#306](https://github.com/getsentry/XcodeBuildMCP/issues/306)).
+- Fixed incremental builds with absolute DerivedData paths, long configuration arguments, changed build settings, or updated project files so generated build data is reused only when it is still valid ([#466](https://github.com/getsentry/XcodeBuildMCP/issues/466)).
+- Fixed security risks by preventing environment-derived values from being interpreted as shell commands, verifying downloaded incremental-build tooling before execution, and restricting CI and release workflows to read-only repository access.
+
+Various other internal improvements to stability, performance, and code quality.
 
 ## [2.6.2]
 
@@ -704,3 +749,4 @@ Please note that the UI automation features are an early preview and currently i
 ## [v1.0.1] - 2025-04-02
 - Initial release of XcodeBuildMCP
 - Basic support for building iOS and macOS applications
+
